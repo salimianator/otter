@@ -1,0 +1,36 @@
+# Virtual environments
+otter-env/
+.venv/
+venv/
+env/
+
+# Large data files — download locally via data/inspect.py
+data/*.jsonl
+data/*.parquet
+
+# Model caches
+*.bin
+*.safetensors
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Outputs (generated, not tracked)
+outputs/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+.idea/

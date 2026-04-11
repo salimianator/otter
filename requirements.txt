@@ -1,0 +1,11 @@
+sentence-transformers
+transformers
+torch
+spacy
+nltk
+rouge-score
+accelerate
+datasets
+pandas
+numpy
+tqdm

@@ -1,0 +1,5 @@
+subset,n_examples,ctx_min,ctx_mean,ctx_max,qry_min,qry_mean,qry_max
+qasper,200,1427,3599.3,14640,4,7.8,24
+multifieldqa_en,150,503,4538.6,10330,1,10.3,22
+qmsum,200,1781,10533.3,24573,3,11.6,30
+multi_news,200,114,1893.0,10318,0,0,0
