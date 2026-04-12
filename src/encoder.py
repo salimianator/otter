@@ -1,8 +1,8 @@
 """
 encoder.py — OTTER sentence encoder
 
-Wraps sentence-transformers/all-MiniLM-L6-v2 to produce dense 384-dim
-sentence embeddings used throughout the OTTER compression pipeline.
+Wraps sentence-transformers/all-MiniLM-L6-v2 to produce dense 384 dimensions
+sentence embeddings used throughout the OTTER's compression pipeline.
 """
 
 import numpy as np
