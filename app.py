@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 app.py — OTTER Debugger
 Flask app for interactively testing and visualising the OTTER pipeline.
