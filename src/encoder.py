@@ -71,6 +71,49 @@ class SentenceEncoder:
         """
         return self.encode([query])[0]
 
+    def encode_query_multi(self, query: str) -> np.ndarray:
+        """
+        Encode a query that may contain multiple sub-questions.
+
+        Splits *query* into sub-queries via SentenceSegmenter.  If only
+        one sub-query is detected the result is identical to
+        ``encode_query(query)``.  For multiple sub-queries each is
+        encoded independently and the **element-wise maximum** across
+        all K embedding vectors is returned — a sentence only needs to
+        be relevant to *one* sub-query to receive a high Flash score.
+        The result is always L2-normalised back to unit length.
+
+        Imported inside the method to avoid a circular import
+        (segmenter.py does not import encoder.py, but encoder.py is
+        imported first at module level in other pipeline files).
+
+        Parameters
+        ----------
+        query : str
+            Raw query string; may contain one or more sentences.
+
+        Returns
+        -------
+        np.ndarray
+            Shape [384,] L2-normalised float32 vector representing the
+            union of all sub-queries.
+        """
+        # Local import avoids circular dependency at module level
+        from segmenter import SentenceSegmenter   # noqa: PLC0415
+
+        seg = SentenceSegmenter(min_words=3)      # low threshold for short sub-queries
+        sub_queries = seg.segment(query)
+
+        if len(sub_queries) <= 1:
+            return self.encode_query(query)
+
+        sub_vecs = self.encode(sub_queries)               # [K, 384], L2-normed
+        merged   = np.max(sub_vecs, axis=0)               # [384,]  element-wise max
+        norm     = np.linalg.norm(merged)
+        if norm > 0:
+            merged = merged / norm
+        return merged.astype(np.float32)
+
 
 # ---------------------------------------------------------------------------
 # End-to-end smoke test: segmenter → encoder → top-3 retrieval
@@ -114,3 +157,28 @@ if __name__ == "__main__":
     print(f"\nTop-3 sentences for query:")
     for rank, idx in enumerate(top3_idx, 1):
         print(f"  Rank {rank} | score {scores[idx]:.2f} | {sentences[idx]}")
+
+    # -----------------------------------------------------------------------
+    # Test 2 — encode_query_multi: single vs. multi-part query
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("encode_query_multi — single vs. multi-part query")
+    print("=" * 60)
+
+    SINGLE = "What is the main contribution?"
+    MULTI  = (
+        "What is the main contribution? "
+        "Who are the primary authors? "
+        "Which dataset was used for evaluation?"
+    )
+
+    for label, q in [("Single-part", SINGLE), ("Multi-part ", MULTI)]:
+        vec  = encoder.encode_query_multi(q)
+        norm = np.linalg.norm(vec)
+        # Peek at how many sub-queries were detected (re-segment locally)
+        from segmenter import SentenceSegmenter as _Seg
+        n_sub = len(_Seg(min_words=3).segment(q))
+        print(f"\n  {label}: {q!r}")
+        print(f"    sub-queries detected : {n_sub}")
+        print(f"    output shape         : {vec.shape}  (expect (384,))")
+        print(f"    L2 norm              : {norm:.6f}  (expect ~1.0)")

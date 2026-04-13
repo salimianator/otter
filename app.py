@@ -72,15 +72,14 @@ def compress():
     if not sentences:
         return jsonify({"error": "No sentences detected in document."}), 400
 
-    # 2 — encode
+    # 2 — encode sentences only (query encoding handled inside planner.score)
     sent_vecs = encoder.encode(sentences)
-    query_vec = encoder.encode_query(query)
 
     # 3 — classify
     weights = classifier.get_weights(query)
 
-    # 4 — score
-    score_d = planner.score(sent_vecs, query_vec, weights)
+    # 4 — score (query string passed directly; multi-part handled internally)
+    score_d = planner.score(sent_vecs, query, weights)
     combined = score_d["combined"]
 
     # 5 — select (returns kept sentence strings)

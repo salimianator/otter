@@ -52,7 +52,7 @@ class QueryPlanner:
     def score(
         self,
         embeddings: np.ndarray,   # [N, 384] float32, L2-normalised
-        query_vec:  np.ndarray,   # [384,]   float32, L2-normalised
+        query:      str,          # raw query string (may be multi-part)
         weights:    dict,         # output of QueryClassifier.get_weights()
     ) -> dict:                    # keys: anchor, flow, flash, combined
         """
@@ -60,13 +60,18 @@ class QueryPlanner:
 
         Three sub-scores are computed independently then blended with
         the adaptive weights (alpha, beta, gamma) from the classifier.
+        The query string is encoded internally via
+        ``SentenceEncoder.encode_query_multi`` so multi-part queries
+        (several questions separated by sentence boundaries) are handled
+        correctly — a sentence only needs to match *one* sub-query to
+        receive a high Flash score.
 
         Parameters
         ----------
         embeddings : np.ndarray, shape [N, 384]
             L2-normalised sentence embeddings.
-        query_vec : np.ndarray, shape [384,]
-            L2-normalised query embedding.
+        query : str
+            Raw query string; may contain one or more sub-questions.
         weights : dict
             Must contain keys ``alpha``, ``beta``, ``gamma`` (floats).
 
@@ -78,6 +83,13 @@ class QueryPlanner:
             ``flash``    – [N,] float32 flash (cosine-sim) scores
             ``combined`` – [N,] float32 weighted blend
         """
+        # Import here to keep the module-level footprint small and avoid
+        # any chance of a circular import at load time.
+        from encoder import SentenceEncoder   # noqa: PLC0415
+
+        _enc = SentenceEncoder()
+        query_vec = _enc.encode_query_multi(query)   # [384,], L2-normalised
+
         N = len(embeddings)
 
         # (a) Anchor scores ------------------------------------------------
@@ -194,15 +206,14 @@ if __name__ == "__main__":
     # --- Step 2: encode ---
     encoder    = SentenceEncoder()
     sent_vecs  = encoder.encode(sentences)
-    query_vec  = encoder.encode_query(query)
 
     # --- Step 3: classify → weights ---
     classifier = QueryClassifier(encoder)
     weights    = classifier.get_weights(query)
 
-    # --- Step 4: score + select ---
+    # --- Step 4: score + select (query string passed directly) ---
     planner   = QueryPlanner()
-    score_d   = planner.score(sent_vecs, query_vec, weights)
+    score_d   = planner.score(sent_vecs, query, weights)
     kept      = planner.select(sentences, score_d["combined"], threshold=0.85)
 
     ratio = len(kept) / len(sentences)
