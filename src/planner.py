@@ -54,9 +54,9 @@ class QueryPlanner:
         embeddings: np.ndarray,   # [N, 384] float32, L2-normalised
         query_vec:  np.ndarray,   # [384,]   float32, L2-normalised
         weights:    dict,         # output of QueryClassifier.get_weights()
-    ) -> np.ndarray:              # [N,] float32 combined scores
+    ) -> dict:                    # keys: anchor, flow, flash, combined
         """
-        Compute per-sentence combined scores.
+        Compute per-sentence scores for all three signals plus their blend.
 
         Three sub-scores are computed independently then blended with
         the adaptive weights (alpha, beta, gamma) from the classifier.
@@ -72,8 +72,11 @@ class QueryPlanner:
 
         Returns
         -------
-        np.ndarray, shape [N,], dtype float32
-            Combined score for every sentence.
+        dict with keys:
+            ``anchor``   – [N,] float32 anchor scores
+            ``flow``     – [N,] float32 flow scores
+            ``flash``    – [N,] float32 flash (cosine-sim) scores
+            ``combined`` – [N,] float32 weighted blend
         """
         N = len(embeddings)
 
@@ -107,13 +110,19 @@ class QueryPlanner:
             weights["alpha"] * anchor +
             weights["beta"]  * flow   +
             weights["gamma"] * flash
-        )
-        return combined.astype(np.float32)
+        ).astype(np.float32)
+
+        return {
+            "anchor":   anchor,
+            "flow":     flow,
+            "flash":    flash,
+            "combined": combined,
+        }
 
     def select(
         self,
         sentences: list[str],
-        scores:    np.ndarray,       # [N,] output of score()
+        scores:    np.ndarray,       # [N,] combined array from score()["combined"]
         threshold: float = 0.85,
     ) -> list[str]:
         """
@@ -192,9 +201,9 @@ if __name__ == "__main__":
     weights    = classifier.get_weights(query)
 
     # --- Step 4: score + select ---
-    planner  = QueryPlanner()
-    scores   = planner.score(sent_vecs, query_vec, weights)
-    kept     = planner.select(sentences, scores, threshold=0.85)
+    planner   = QueryPlanner()
+    score_d   = planner.score(sent_vecs, query_vec, weights)
+    kept      = planner.select(sentences, score_d["combined"], threshold=0.85)
 
     ratio = len(kept) / len(sentences)
 
