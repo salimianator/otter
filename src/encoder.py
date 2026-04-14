@@ -8,6 +8,8 @@ sentence embeddings used throughout the OTTER's compression pipeline.
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+from device import get_device
+
 
 class SentenceEncoder:
     """
@@ -25,9 +27,10 @@ class SentenceEncoder:
 
     @property
     def model(self) -> SentenceTransformer:
-        """Lazy-load and cache the underlying SentenceTransformer."""
+        """Lazy-load and cache the SentenceTransformer on the best device."""
         if self._model is None:
-            self._model = SentenceTransformer(self.model_name)
+            device = get_device()
+            self._model = SentenceTransformer(self.model_name, device=str(device))
         return self._model
 
     def encode(self, sentences: list[str]) -> np.ndarray:

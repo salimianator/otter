@@ -12,8 +12,14 @@ compressor — keeping iteration fast.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+from device import get_device  # noqa: E402
 
 
 class QwenEvaluator:
@@ -35,46 +41,31 @@ class QwenEvaluator:
         load_on_init: bool = False,
     ) -> None:
         self.model_name = model_name
+        self.device     = get_device()           # MPS / CUDA / CPU
         self._tokenizer: AutoTokenizer | None = None
         self._model: AutoModelForCausalLM | None = None
 
         if load_on_init:
             self._load()
 
-    @staticmethod
-    def _best_device() -> tuple[str, torch.dtype]:
-        """
-        Pick the best available device and a compatible dtype.
-
-        - CUDA  → float16,  device_map="auto"  (supports bfloat16 offload)
-        - MPS   → float16,  device placed on "mps" explicitly
-                  (MPS does NOT support bfloat16; must avoid disk offload)
-        - CPU   → float32,  device_map="cpu"
-        """
-        if torch.cuda.is_available():
-            return "auto", torch.float16
-        if torch.backends.mps.is_available():
-            return "mps", torch.float16
-        return "cpu", torch.float32
-
     def _load(self) -> None:
-        """Load tokenizer and model if not already in memory."""
+        """Load tokenizer and model onto self.device if not already in memory."""
         if self._model is not None:
             return
 
-        device_map, dtype = self._best_device()
-        print(f"Loading {self.model_name} … (device={device_map}, dtype={dtype})")
+        # float16 halves memory and is faster on both MPS and CUDA.
+        # device_map=None lets us call .to(device) ourselves, which avoids
+        # accelerate's disk-offload path that fails on MPS with bfloat16.
+        dtype = torch.float16 if self.device.type in ("mps", "cuda") else torch.float32
+        print(f"Loading {self.model_name} … (device={self.device}, dtype={dtype})")
 
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-
-        # For MPS we pass the explicit string so accelerate places every
-        # layer there and never falls back to disk offloading (which would
-        # try to cast bfloat16 back to MPS and fail).
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            dtype=dtype,
-            device_map=device_map,
+            dtype=dtype,         # 'dtype' is the non-deprecated kwarg
+            device_map=None,     # load to CPU first, then move to target device
         )
+        self._model = self._model.to(self.device)
         self._model.eval()
         print("Model loaded.")
 
@@ -102,14 +93,17 @@ class QwenEvaluator:
             "Answer concisely based only on the context above:\n"
         )
 
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
+        # Move every input tensor explicitly to the target device
+        raw_inputs = self._tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in raw_inputs.items()}
 
         with torch.no_grad():
             output_ids = self._model.generate(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=200,
                 do_sample=False,
-                temperature=1.0,
+                temperature=None,   # must be None when do_sample=False
+                top_p=None,         # must be None when do_sample=False
                 pad_token_id=self._tokenizer.eos_token_id,
             )
 
