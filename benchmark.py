@@ -156,13 +156,35 @@ def run_benchmark(
     print("Loading Qwen2.5-3B-Instruct …")
     evaluator = QwenEvaluator(load_on_init=True)
 
-    metric = select_metric(subset)
-    print(f"\nRunning {mode.upper()} benchmark on {subset} "
-          f"({total} examples, metric={metric})\n")
+    metric       = select_metric(subset)
+    metric_label = metric.upper()
+    skipped      = len(completed_ids)
+    todo         = total - skipped
+
+    print(f"\nRunning {mode.upper()} benchmark on {subset}")
+    print(f"  total={total}  already_done={skipped}  to_run={todo}  metric={metric_label}\n")
+
+    # ── running accumulators for postfix display ──────────────────────────────
+    scores_so_far:       list[float] = []
+    latencies_so_far:    list[float] = []
+    compressions_so_far: list[float] = []
 
     # ── main loop ────────────────────────────────────────────────────────────
+    bar = tqdm(
+        examples,
+        desc=f"{mode}",
+        unit="ex",
+        total=total,
+        initial=skipped,          # ETA is based on remaining work only
+        dynamic_ncols=True,
+        bar_format=(
+            "{l_bar}{bar}| {n_fmt}/{total_fmt}"
+            " [{elapsed}<{remaining}, {rate_fmt}]{postfix}"
+        ),
+    )
+
     with open(output_path, "a", encoding="utf-8") as out_fh:
-        for ex_idx, record in enumerate(tqdm(examples, desc=mode, unit="ex")):
+        for ex_idx, record in enumerate(bar):
             if ex_idx in completed_ids:
                 continue
 
@@ -172,10 +194,10 @@ def run_benchmark(
 
             # (b) Compress or pass through
             if mode == "otter":
-                result           = compressor.compress(context, query, threshold)
-                input_text       = result["compressed"]
+                result            = compressor.compress(context, query, threshold)
+                input_text        = result["compressed"]
                 compression_ratio = result["compression_ratio"]
-                token_reduction  = result["token_reduction_pct"]
+                token_reduction   = result["token_reduction_pct"]
             else:
                 input_text        = context
                 compression_ratio = 1.0
@@ -184,9 +206,9 @@ def run_benchmark(
             input_text = truncate_to_token_limit(input_text)
 
             # (c) Generate answer
-            t0       = time.time()
+            t0        = time.time()
             generated = evaluator.answer(input_text, query)
-            latency  = time.time() - t0
+            latency   = time.time() - t0
 
             # (d) Score
             if metric == "f1":
@@ -200,30 +222,46 @@ def run_benchmark(
 
             # (e) Build result record
             out_record = {
-                "id":                 ex_idx,
-                "query":              query,
-                "ground_truth":       answers,
-                "generated":          generated,
-                "compression_ratio":  round(compression_ratio, 4),
-                "token_reduction_pct":round(token_reduction, 2),
-                "f1":                 round(f1, 4)      if f1      is not None else None,
-                "rouge_l":            round(rouge_l, 4) if rouge_l is not None else None,
-                "latency_s":          round(latency, 2),
+                "id":                  ex_idx,
+                "query":               query,
+                "ground_truth":        answers,
+                "generated":           generated,
+                "compression_ratio":   round(compression_ratio, 4),
+                "token_reduction_pct": round(token_reduction, 2),
+                "f1":                  round(f1, 4)      if f1      is not None else None,
+                "rouge_l":             round(rouge_l, 4) if rouge_l is not None else None,
+                "latency_s":           round(latency, 2),
             }
 
             # (f) Append immediately
             out_fh.write(json.dumps(out_record) + "\n")
             out_fh.flush()
 
-            # (g) One-line progress
-            metric_lbl = f"{metric.upper()}: {score_val:.3f}"
-            tqdm.write(
-                f"  [{ex_idx + 1}/{total}] {metric_lbl} | "
-                f"compression: {compression_ratio:.0%} | "
-                f"latency: {latency:.1f}s"
-            )
+            # (g) Update running accumulators
+            scores_so_far.append(score_val)
+            latencies_so_far.append(latency)
+            compressions_so_far.append(compression_ratio)
 
+            mean_score       = sum(scores_so_far)       / len(scores_so_far)
+            mean_latency     = sum(latencies_so_far)    / len(latencies_so_far)
+            mean_compression = sum(compressions_so_far) / len(compressions_so_far)
+
+            # Update the bar's postfix (shown on the same line as the bar)
+            bar.set_postfix(ordered_dict={
+                f"mean_{metric_label}": f"{mean_score:.3f}",
+                "last":                 f"{score_val:.3f}",
+                "cmp":                  f"{mean_compression:.0%}",
+                "lat":                  f"{mean_latency:.1f}s",
+            })
+
+    bar.close()
     print(f"\nResults written to {output_path}")
+    print(
+        f"Final averages — "
+        f"mean {metric_label}: {sum(scores_so_far)/max(len(scores_so_far),1):.4f} | "
+        f"mean compression: {sum(compressions_so_far)/max(len(compressions_so_far),1):.1%} | "
+        f"mean latency: {sum(latencies_so_far)/max(len(latencies_so_far),1):.1f}s"
+    )
     return output_path
 
 
