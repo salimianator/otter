@@ -17,19 +17,13 @@ sys.path.insert(0, str(SRC))
 
 from flask import Flask, jsonify, request
 
-from classifier import QueryClassifier
-from encoder    import SentenceEncoder
-from planner    import QueryPlanner
-from segmenter  import SentenceSegmenter
+from compress import OTTERCompressor
 
 app = Flask(__name__)
 
 # ── initialise pipeline once at startup ─────────────────────────────────────
 print("Initialising OTTER pipeline …")
-segmenter  = SentenceSegmenter(min_words=6)
-encoder    = SentenceEncoder()          # lazy-loads on first encode() call
-classifier = QueryClassifier(encoder)  # encodes prototypes → triggers load
-planner    = QueryPlanner()
+compressor = OTTERCompressor()
 print("Pipeline ready.")
 
 # ── load example from qasper for the "Load Example" button ──────────────────
@@ -67,51 +61,37 @@ def compress():
     if not document or not query:
         return jsonify({"error": "document and query are required"}), 400
 
-    # 1 — segment
-    sentences = segmenter.segment(document)
-    if not sentences:
+    # Run the full OTTER pipeline via OTTERCompressor
+    result = compressor.compress(document, query, threshold)
+
+    if result["original_sentences"] == 0:
         return jsonify({"error": "No sentences detected in document."}), 400
 
-    # 2 — encode sentences only (query encoding handled inside planner.score)
-    sent_vecs = encoder.encode(sentences)
-
-    # 3 — classify
-    weights = classifier.get_weights(query)
-
-    # 4 — score (query string passed directly; multi-part handled internally)
-    score_d = planner.score(sent_vecs, query, weights)
-    combined = score_d["combined"]
-
-    # 5 — select (returns kept sentence strings)
-    kept_texts = planner.select(sentences, combined, threshold=threshold)
-    kept_set   = set(kept_texts)  # fast membership; texts are unique enough
-
-    # Build per-sentence payload
-    # Use index-based kept tracking for robustness (duplicate texts)
+    # Unpack for the per-sentence visualisation payload
     import numpy as np
-    ranked_idx  = np.argsort(combined)[::-1]
-    cumsum      = np.cumsum(combined[ranked_idx])
-    total_score = float(cumsum[-1])
-    cutoff_pos  = int(np.searchsorted(cumsum, threshold * total_score))
-    cutoff_pos  = min(cutoff_pos, len(sentences) - 1)
+    sentences = compressor.segmenter.segment(document)   # re-segment for row data
+    score_d   = result["scores"]
+    combined  = score_d["combined"]
+    weights   = result["weights"]
+
+    ranked_idx   = np.argsort(combined)[::-1]
+    cumsum       = np.cumsum(combined[ranked_idx])
+    cutoff_pos   = int(np.searchsorted(cumsum, threshold * float(cumsum[-1])))
+    cutoff_pos   = min(cutoff_pos, len(sentences) - 1)
     kept_indices = set(ranked_idx[: cutoff_pos + 1].tolist())
 
-    sentence_rows = []
-    for i, text in enumerate(sentences):
-        sentence_rows.append({
-            "index":         i,
-            "text":          text,
-            "anchor_score":  round(float(score_d["anchor"][i]),  4),
-            "flow_score":    round(float(score_d["flow"][i]),    4),
-            "flash_score":   round(float(score_d["flash"][i]),   4),
-            "combined_score":round(float(combined[i]),           4),
-            "kept":          i in kept_indices,
-        })
-
-    kept_count  = len(kept_indices)
-    total_count = len(sentences)
-    comp_ratio  = kept_count / total_count
-    output_text = " ".join(sentences[i] for i in sorted(kept_indices))
+    sentence_rows = [
+        {
+            "index":          i,
+            "text":           text,
+            "anchor_score":   round(float(score_d["anchor"][i]),  4),
+            "flow_score":     round(float(score_d["flow"][i]),    4),
+            "flash_score":    round(float(score_d["flash"][i]),   4),
+            "combined_score": round(float(combined[i]),           4),
+            "kept":           i in kept_indices,
+        }
+        for i, text in enumerate(sentences)
+    ]
 
     return jsonify({
         "query":      query,
@@ -123,12 +103,12 @@ def compress():
         },
         "sentences": sentence_rows,
         "stats": {
-            "total_sentences":    total_count,
-            "kept_sentences":     kept_count,
-            "compression_ratio":  round(comp_ratio, 4),
-            "token_reduction_pct":round((1 - comp_ratio) * 100, 2),
+            "total_sentences":    result["original_sentences"],
+            "kept_sentences":     result["kept_sentences"],
+            "compression_ratio":  round(result["compression_ratio"], 4),
+            "token_reduction_pct":round(result["token_reduction_pct"], 2),
         },
-        "output": output_text,
+        "output": result["compressed"],
     })
 
 
