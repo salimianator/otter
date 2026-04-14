@@ -61,10 +61,10 @@ class QueryPlanner:
         Three sub-scores are computed independently then blended with
         the adaptive weights (alpha, beta, gamma) from the classifier.
         The query string is encoded internally via
-        ``SentenceEncoder.encode_query_multi`` so multi-part queries
-        (several questions separated by sentence boundaries) are handled
-        correctly — a sentence only needs to match *one* sub-query to
-        receive a high Flash score.
+        ``SentenceEncoder.encode_query_multi`` which returns a [K x 384]
+        matrix (K=1 for single queries).  Flash scores are computed as
+        ``max over K`` of the per-sub-query cosine similarities, so a
+        sentence only needs to match *one* sub-query to score highly.
 
         Parameters
         ----------
@@ -87,8 +87,8 @@ class QueryPlanner:
         # any chance of a circular import at load time.
         from encoder import SentenceEncoder   # noqa: PLC0415
 
-        _enc = SentenceEncoder()
-        query_vec = _enc.encode_query_multi(query)   # [384,], L2-normalised
+        _enc      = SentenceEncoder()
+        query_mat = _enc.encode_query_multi(query)   # [K, 384], L2-normalised
 
         N = len(embeddings)
 
@@ -100,7 +100,12 @@ class QueryPlanner:
             anchor[max(N - n_anchor, n_anchor):] = 1.0
 
         # (b) Flash scores -------------------------------------------------
-        flash = (embeddings @ query_vec).astype(np.float32)   # [N,]
+        # [N x K] similarity matrix — each column is one sub-query's scores.
+        # Taking the row-wise max gives each sentence credit for its best
+        # matching sub-query; a sentence only needs to answer *one* question
+        # to score highly.
+        flash_per_query = (embeddings @ query_mat.T).astype(np.float32)  # [N, K]
+        flash = np.max(flash_per_query, axis=1)                           # [N,]
 
         # (c) Flow scores --------------------------------------------------
         flow = np.zeros(N, dtype=np.float32)
@@ -240,3 +245,34 @@ if __name__ == "__main__":
     print("\n--- Last 5 kept sentences ---")
     for i, s in enumerate(kept[-5:], start=len(kept) - 5):
         print(f"  [{i}] {s}")
+
+    # -----------------------------------------------------------------------
+    # Multi-part query validation — per-sub-query top-5
+    # -----------------------------------------------------------------------
+    MULTI_QUERY = (
+        "What is the main contribution? "
+        "Who are the primary authors?"
+    )
+
+    print("\n" + "=" * 66)
+    print("Multi-part query — per-sub-query top-5 validation")
+    print("=" * 66)
+    print(f"Query: {MULTI_QUERY!r}\n")
+
+    query_mat = encoder.encode_query_multi(MULTI_QUERY)   # [K, 384]
+    print(f"Sub-queries detected: {query_mat.shape[0]}")
+    print(f"Query matrix shape  : {query_mat.shape}\n")
+
+    flash_per_q = sent_vecs @ query_mat.T                 # [N, K]
+
+    sub_labels = [
+        "What is the main contribution?",
+        "Who are the primary authors?",
+    ]
+    for k, label in enumerate(sub_labels[:query_mat.shape[0]]):
+        col = flash_per_q[:, k]
+        top5 = np.argsort(col)[::-1][:5]
+        print(f"  Sub-query {k+1}: {label!r}")
+        for rank, idx in enumerate(top5, 1):
+            print(f"    Rank {rank} | score {col[idx]:.3f} | {sentences[idx][:90]}")
+        print()

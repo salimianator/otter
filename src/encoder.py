@@ -73,15 +73,14 @@ class SentenceEncoder:
 
     def encode_query_multi(self, query: str) -> np.ndarray:
         """
-        Encode a query that may contain multiple sub-questions.
+        Encode a query (single or multi-part) into a [K x 384] matrix.
 
-        Splits *query* into sub-queries via SentenceSegmenter.  If only
-        one sub-query is detected the result is identical to
-        ``encode_query(query)``.  For multiple sub-queries each is
-        encoded independently and the **element-wise maximum** across
-        all K embedding vectors is returned — a sentence only needs to
-        be relevant to *one* sub-query to receive a high Flash score.
-        The result is always L2-normalised back to unit length.
+        Splits *query* into sub-queries via SentenceSegmenter and encodes
+        each independently.  Always returns a 2-D matrix so the caller
+        can apply per-sub-query scoring (e.g. ``embeddings @ Q.T`` then
+        ``np.max(..., axis=1)``) rather than collapsing to a single vector
+        before scoring.  This preserves the distinct retrieval signal of
+        each sub-question.
 
         Imported inside the method to avoid a circular import
         (segmenter.py does not import encoder.py, but encoder.py is
@@ -95,8 +94,8 @@ class SentenceEncoder:
         Returns
         -------
         np.ndarray
-            Shape [384,] L2-normalised float32 vector representing the
-            union of all sub-queries.
+            Shape [K, 384] float32, one L2-normalised row per sub-query.
+            K=1 for a single question, K>1 for multi-part queries.
         """
         # Local import avoids circular dependency at module level
         from segmenter import SentenceSegmenter   # noqa: PLC0415
@@ -104,15 +103,8 @@ class SentenceEncoder:
         seg = SentenceSegmenter(min_words=3)      # low threshold for short sub-queries
         sub_queries = seg.segment(query)
 
-        if len(sub_queries) <= 1:
-            return self.encode_query(query)
-
-        sub_vecs = self.encode(sub_queries)               # [K, 384], L2-normed
-        merged   = np.max(sub_vecs, axis=0)               # [384,]  element-wise max
-        norm     = np.linalg.norm(merged)
-        if norm > 0:
-            merged = merged / norm
-        return merged.astype(np.float32)
+        # Always return 2-D [K, 384] — encode() handles K=1 fine
+        return self.encode(sub_queries)           # already L2-normalised per row
 
 
 # ---------------------------------------------------------------------------
@@ -173,12 +165,10 @@ if __name__ == "__main__":
     )
 
     for label, q in [("Single-part", SINGLE), ("Multi-part ", MULTI)]:
-        vec  = encoder.encode_query_multi(q)
-        norm = np.linalg.norm(vec)
-        # Peek at how many sub-queries were detected (re-segment locally)
-        from segmenter import SentenceSegmenter as _Seg
-        n_sub = len(_Seg(min_words=3).segment(q))
+        mat = encoder.encode_query_multi(q)           # now [K, 384]
+        row_norms = np.linalg.norm(mat, axis=1)
         print(f"\n  {label}: {q!r}")
-        print(f"    sub-queries detected : {n_sub}")
-        print(f"    output shape         : {vec.shape}  (expect (384,))")
-        print(f"    L2 norm              : {norm:.6f}  (expect ~1.0)")
+        print(f"    output shape         : {mat.shape}  "
+              f"(expect [1, 384] or [K, 384])")
+        print(f"    L2 norm (each row)   : {np.array2string(row_norms, precision=6)}  "
+              f"(expect all ~1.0)")
