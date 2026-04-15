@@ -42,7 +42,7 @@ from score    import (                 # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_WORDS   = 24_000          # ≈ 31 200 tokens @ 1.3 tok/word — under 32k
+MAX_WORDS   = 1_500           # ~2 000 tokens — keeps Qwen latency under ~25s/ex
 RESULTS_DIR = ROOT / "results"
 DATA_DIR    = ROOT / "data"
 
@@ -91,7 +91,6 @@ def load_jsonl(path: Path) -> list[dict]:
 def run_benchmark(
     subset: str,
     mode: str,
-    threshold: float = 0.85,
     max_examples: int | None = None,
     resume: bool = True,
 ) -> Path:
@@ -107,8 +106,6 @@ def run_benchmark(
         LongBench subset name (e.g. ``'qasper'``).
     mode : str
         ``'otter'`` (compress then answer) or ``'baseline'`` (answer as-is).
-    threshold : float
-        OTTER cumulative selection threshold (ignored in baseline mode).
     max_examples : int or None
         Cap the number of examples processed; None means all.
     resume : bool
@@ -194,7 +191,7 @@ def run_benchmark(
 
             # (b) Compress or pass through
             if mode == "otter":
-                result            = compressor.compress(context, query, threshold)
+                result            = compressor.compress(context, query)
                 input_text        = result["compressed"]
                 compression_ratio = result["compression_ratio"]
                 token_reduction   = result["token_reduction_pct"]
@@ -367,8 +364,6 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="LongBench subset name")
     p.add_argument("--mode",       default="otter", choices=["otter", "baseline"],
                    help="Compression mode")
-    p.add_argument("--threshold",  type=float, default=0.85,
-                   help="OTTER cumulative selection threshold")
     p.add_argument("--max",        type=int, default=None, dest="max_examples",
                    help="Maximum number of examples to run (None = all)")
     p.add_argument("--summarise",  action="store_true",
@@ -387,7 +382,6 @@ if __name__ == "__main__":
         run_benchmark(
             subset=args.subset,
             mode=args.mode,
-            threshold=args.threshold,
             max_examples=args.max_examples,
             resume=not args.no_resume,
         )

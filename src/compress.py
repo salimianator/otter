@@ -63,9 +63,8 @@ class OTTERCompressor:
 
     def compress(
         self,
-        document:  str,
-        query:     str,
-        threshold: float = 0.85,
+        document: str,
+        query:    str,
     ) -> dict:
         """
         Run the full OTTER pipeline on *document* given *query*.
@@ -77,9 +76,6 @@ class OTTERCompressor:
         query : str
             Query string; may be multi-part (sub-questions separated by
             sentence boundaries are handled automatically).
-        threshold : float
-            Cumulative score fraction to retain (default: 0.85).
-            Lower → more aggressive compression.
 
         Returns
         -------
@@ -91,7 +87,14 @@ class OTTERCompressor:
             token_reduction_pct – float ((1 - ratio) * 100)
             weights             – dict from QueryClassifier
             scores              – dict {anchor, flow, flash, combined} arrays
+            selection_method    – str, 'kneedle' or 'marginal_return'
         """
+        # Guard: empty query (e.g. multi_news has no input field) — substitute a
+        # generic abstractive prompt so Flash scoring gets a meaningful query
+        # vector rather than near-zero cosine similarities across all sentences.
+        if not query or not query.strip():
+            query = "Summarize the main points of this document."
+
         # (a) Segment
         sentences = self.segmenter.segment(document)
         if not sentences:
@@ -118,11 +121,11 @@ class OTTERCompressor:
             weights=weights,
         )
 
-        # (e) Select
+        # (e) Select — continuously interpolated via three-class softmax weights
         kept_sentences = self.planner.select(
             sentences=sentences,
             scores=score_dict["combined"],
-            threshold=threshold,
+            weights=weights,
         )
 
         # (f) Assemble
@@ -137,6 +140,7 @@ class OTTERCompressor:
             "token_reduction_pct": (1 - len(kept_sentences) / len(sentences)) * 100,
             "weights":             weights,
             "scores":              score_dict,
+            "selection_method":    weights["dominant"],
         }
 
 
@@ -145,10 +149,9 @@ class OTTERCompressor:
 # ---------------------------------------------------------------------------
 
 def compress(
-    document:    str,
-    query:       str,
-    threshold:   float = 0.85,
-    compressor:  OTTERCompressor | None = None,
+    document:   str,
+    query:      str,
+    compressor: OTTERCompressor | None = None,
 ) -> dict:
     """
     Compress *document* given *query* using the OTTER pipeline.
@@ -159,8 +162,6 @@ def compress(
         Raw long-context document text.
     query : str
         Query string (single or multi-part).
-    threshold : float
-        Cumulative score fraction to retain (default: 0.85).
     compressor : OTTERCompressor, optional
         Pre-initialised compressor to reuse across calls.
         If None, a fresh OTTERCompressor is created (models will reload).
@@ -172,7 +173,7 @@ def compress(
     """
     if compressor is None:
         compressor = OTTERCompressor()
-    return compressor.compress(document, query, threshold)
+    return compressor.compress(document, query)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +200,7 @@ if __name__ == "__main__":
         context = record["context"]
         query   = record["input"]
 
-        result  = compressor.compress(context, query, threshold=0.85)
+        result  = compressor.compress(context, query)
         w       = result["weights"]
         kept    = result["kept_sentences"]
         total   = result["original_sentences"]

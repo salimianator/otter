@@ -46,6 +46,19 @@ ABSTRACTIVE_PROTOTYPES: list[str] = [
     "Enumerate the principal contributions of this work.",
 ]
 
+ENUMERATION_PROTOTYPES: list[str] = [
+    "What datasets were used in the experiments?",
+    "What are the evaluation metrics used?",
+    "Which baselines does the paper compare against?",
+    "What are the main contributions of this work?",
+    "What types of features are extracted?",
+    "List the models they experimented with.",
+    "What topics does the dataset cover?",
+    "What languages are included in the corpus?",
+    "What are the hyperparameters used?",
+    "Which tasks does the method evaluate on?",
+]
+
 
 # ---------------------------------------------------------------------------
 # Classifier
@@ -64,22 +77,19 @@ class QueryClassifier:
 
     def __init__(self, encoder: SentenceEncoder) -> None:
         self.encoder = encoder
-        self.extractive_centroid = self._build_centroid(EXTRACTIVE_PROTOTYPES)
-        self.abstractive_centroid = self._build_centroid(ABSTRACTIVE_PROTOTYPES)
+        self.extractive_centroid   = self._build_centroid(EXTRACTIVE_PROTOTYPES)
+        self.enumeration_centroid  = self._build_centroid(ENUMERATION_PROTOTYPES)
+        self.abstractive_centroid  = self._build_centroid(ABSTRACTIVE_PROTOTYPES)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def classify(self, query: str) -> float:
+    def get_weights(self, query: str) -> dict:
         """
-        Return an extractive score in [0, 1].
-
-        1.0 → fully extractive (fact lookup, named-entity retrieval)
-        0.0 → fully abstractive (summarisation, explanation, overview)
-
-        Uses dot-product similarity against pre-computed centroids
-        (equivalent to cosine similarity since all vectors are L2-normalised).
+        Classify *query* into three soft classes (extractive / enumeration /
+        abstractive) via softmax over centroid similarities, then continuously
+        interpolate planner weights from the three-class mixture.
 
         Parameters
         ----------
@@ -88,40 +98,49 @@ class QueryClassifier:
 
         Returns
         -------
-        float
-            Soft extractive score.
+        dict with keys:
+            w_ext, w_enum, w_abs  – softmax class weights (sum to 1.0)
+            dominant              – 'extractive' | 'enumeration' | 'abstractive'
+            alpha                 – Anchor weight
+            beta                  – Flow weight
+            gamma                 – Flash weight
+            floor_ratio           – selection floor passed to planner
+            enum_decay            – running-mean decay passed to planner
         """
-        q_vec = self.encoder.encode_query(query)
-        sim_e = float(q_vec @ self.extractive_centroid)
-        sim_a = float(q_vec @ self.abstractive_centroid)
-        denom = sim_e + sim_a
-        return sim_e / denom if denom > 0 else 0.5
+        q_vec  = self.encoder.encode_query(query)
 
-    def get_weights(self, query: str) -> dict[str, float]:
-        """
-        Return adaptive planner weights for *query*.
+        s_ext  = float(q_vec @ self.extractive_centroid)
+        s_enum = float(q_vec @ self.enumeration_centroid)
+        s_abs  = float(q_vec @ self.abstractive_centroid)
 
-        Weight ranges
-        -------------
-        gamma (Flash)  : 0.4 (abstractive) → 0.9 (extractive)
-        alpha (Anchor) : 0.8 (abstractive) → 0.4 (extractive)
-        beta  (Flow)   : 0.5 (abstractive) → 0.3 (extractive)
+        # Stable softmax over the three similarities
+        scores     = np.array([s_ext, s_enum, s_abs])
+        exp_scores = np.exp(scores - scores.max())
+        w_ext, w_enum, w_abs = (exp_scores / exp_scores.sum()).tolist()
 
-        Parameters
-        ----------
-        query : str
-            The raw query string.
+        # Interpolate planner scoring weights
+        alpha = w_ext * 0.40 + w_enum * 0.50 + w_abs * 0.80
+        beta  = w_ext * 0.30 + w_enum * 0.50 + w_abs * 0.50
+        gamma = w_ext * 0.90 + w_enum * 0.70 + w_abs * 0.40
 
-        Returns
-        -------
-        dict with keys: extractive_score, alpha, beta, gamma
-        """
-        s = self.classify(query)
+        # Interpolate selection parameters
+        floor_ratio = w_ext * 0.15 + w_enum * 0.30 + w_abs * 0.60
+        enum_decay  = w_ext * 0.50 + w_enum * 0.70 + w_abs * 0.90
+
+        # Dominant class label
+        labels   = ["extractive", "enumeration", "abstractive"]
+        dominant = labels[int(np.argmax([w_ext, w_enum, w_abs]))]
+
         return {
-            "extractive_score": round(s, 4),
-            "alpha": round(0.8 - 0.4 * s, 4),   # Anchor: 0.8 → 0.4
-            "beta":  round(0.5 - 0.2 * s, 4),   # Flow:   0.5 → 0.3
-            "gamma": round(0.4 + 0.5 * s, 4),   # Flash:  0.4 → 0.9
+            "w_ext":       round(w_ext,       4),
+            "w_enum":      round(w_enum,      4),
+            "w_abs":       round(w_abs,       4),
+            "dominant":    dominant,
+            "alpha":       round(alpha,       4),
+            "beta":        round(beta,        4),
+            "gamma":       round(gamma,       4),
+            "floor_ratio": round(floor_ratio, 4),
+            "enum_decay":  round(enum_decay,  4),
         }
 
     # ------------------------------------------------------------------
@@ -151,32 +170,43 @@ if __name__ == "__main__":
 
     sys.path.insert(0, str(Path(__file__).parent))
 
-    TEST_QUERIES = [
-        "What year was the paper published?",
-        "Who proposed this algorithm?",
-        "Summarise the main contributions.",
-        "Describe the overall methodology.",
-        "What is the F1 score reported on SQuAD?",
-        "Explain the limitations of this approach.",
-        "Enumerate the key findings of this study.",
-        "Which baseline did the proposed method outperform?",
-    ]
+    QUERY_GROUPS = {
+        "Point extraction": [
+            "What is the F1 score reported on SQuAD?",
+            "Who proposed this algorithm?",
+            "How many parameters does the model have?",
+        ],
+        "Enumeration": [
+            "What datasets were used in the experiments?",
+            "Which baselines does the paper compare against?",
+            "What are the main contributions of this work?",
+            "What evaluation metrics are reported?",
+        ],
+        "Abstractive": [
+            "Summarise the key contributions of this paper.",
+            "Describe the overall methodology used.",
+            "Explain the limitations of this approach.",
+        ],
+    }
 
     encoder    = SentenceEncoder()
     classifier = QueryClassifier(encoder)
 
-    # Header
-    col_q  = 46
-    print(f"\n{'Query':<{col_q}}  {'ext_score':>9}  {'alpha':>6}  {'beta':>6}  {'gamma':>6}  {'type'}")
-    print("-" * (col_q + 40))
+    HDR = f"  {'Query':<48}  {'w_ext':>6}  {'w_enum':>6}  {'w_abs':>6}  {'dominant':<13}  {'alpha':>5}  {'beta':>5}  {'gamma':>5}"
+    SEP = "  " + "-" * (len(HDR) - 2)
 
-    for q in TEST_QUERIES:
-        w = classifier.get_weights(q)
-        s = w["extractive_score"]
-        label = "EXTRACT" if s >= 0.55 else ("ABSTACT" if s <= 0.45 else "mixed  ")
-        q_display = (q[:col_q - 1] + "…") if len(q) > col_q else q
-        print(
-            f"{q_display:<{col_q}}  {s:>9.4f}  "
-            f"{w['alpha']:>6.4f}  {w['beta']:>6.4f}  {w['gamma']:>6.4f}  {label}"
-        )
     print()
+    for group_name, queries in QUERY_GROUPS.items():
+        print(f"── {group_name} ──")
+        print(HDR)
+        print(SEP)
+        for q in queries:
+            w = classifier.get_weights(q)
+            q_disp = (q[:47] + "…") if len(q) > 48 else q
+            print(
+                f"  {q_disp:<48}  "
+                f"{w['w_ext']:>6.3f}  {w['w_enum']:>6.3f}  {w['w_abs']:>6.3f}  "
+                f"{w['dominant']:<13}  "
+                f"{w['alpha']:>5.3f}  {w['beta']:>5.3f}  {w['gamma']:>5.3f}"
+            )
+        print()

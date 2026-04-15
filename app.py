@@ -53,32 +53,34 @@ def example():
 
 @app.route("/compress", methods=["POST"])
 def compress():
-    body      = request.get_json(force=True)
-    document  = body.get("document", "").strip()
-    query     = body.get("query", "").strip()
-    threshold = float(body.get("threshold", 0.85))
+    import numpy as np
 
-    if not document or not query:
-        return jsonify({"error": "document and query are required"}), 400
+    body     = request.get_json(force=True)
+    document = body.get("document", "").strip()
+    query    = body.get("query", "").strip()
+
+    if not document:
+        return jsonify({"error": "A document is required."}), 400
 
     # Run the full OTTER pipeline via OTTERCompressor
-    result = compressor.compress(document, query, threshold)
+    result = compressor.compress(document, query)
 
     if result["original_sentences"] == 0:
         return jsonify({"error": "No sentences detected in document."}), 400
 
-    # Unpack for the per-sentence visualisation payload
-    import numpy as np
-    sentences = compressor.segmenter.segment(document)   # re-segment for row data
-    score_d   = result["scores"]
-    combined  = score_d["combined"]
-    weights   = result["weights"]
+    # Unpack scores for the per-sentence visualisation payload
+    sentences  = compressor.segmenter.segment(document)   # re-segment for row data
+    score_d    = result["scores"]
+    combined   = score_d["combined"]
+    weights    = result["weights"]
 
+    # Determine kept indices: re-run select() to get the same boolean mask
+    # (select() is deterministic, so this is safe and avoids storing extra state)
+    _kept_texts  = set(result["compressed"].split())        # not reliable
+    # Instead: rank by combined score and mark top-N where N = kept_sentences
+    n_kept       = result["kept_sentences"]
     ranked_idx   = np.argsort(combined)[::-1]
-    cumsum       = np.cumsum(combined[ranked_idx])
-    cutoff_pos   = int(np.searchsorted(cumsum, threshold * float(cumsum[-1])))
-    cutoff_pos   = min(cutoff_pos, len(sentences) - 1)
-    kept_indices = set(ranked_idx[: cutoff_pos + 1].tolist())
+    kept_indices = set(ranked_idx[:n_kept].tolist())
 
     sentence_rows = [
         {
@@ -96,11 +98,15 @@ def compress():
     return jsonify({
         "query":      query,
         "classifier": {
-            "extractive_score": weights["extractive_score"],
-            "alpha":            weights["alpha"],
-            "beta":             weights["beta"],
-            "gamma":            weights["gamma"],
+            "w_ext":    weights["w_ext"],
+            "w_enum":   weights["w_enum"],
+            "w_abs":    weights["w_abs"],
+            "dominant": weights["dominant"],
+            "alpha":    weights["alpha"],
+            "beta":     weights["beta"],
+            "gamma":    weights["gamma"],
         },
+        "selection_method": result["selection_method"],
         "sentences": sentence_rows,
         "stats": {
             "total_sentences":    result["original_sentences"],
@@ -152,10 +158,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .row2 { display: grid; grid-template-columns: 1fr auto; gap: 16px;
            align-items: end; margin-top: 14px; }
   .query-wrap { display: grid; gap: 6px; }
-  .slider-wrap { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
-  .slider-row  { display: flex; align-items: center; gap: 10px; }
-  input[type=range] { flex: 1; accent-color: #4299e1; }
-  #thresh-val { font-weight: 700; color: #2b6cb0; font-size: .95rem; min-width: 36px; }
+  .method-wrap { display: flex; flex-direction: column; gap: 6px; min-width: 200px; }
+  .method-badge { display: inline-flex; align-items: center; gap: 8px;
+                  background: #ebf8ff; border: 1px solid #bee3f8; border-radius: 8px;
+                  padding: 9px 14px; font-size: .88rem; font-weight: 600; color: #2b6cb0; }
+  .method-badge .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .method-badge.kneedle       .dot { background: #38b2ac; }
+  .method-badge.marginal      .dot { background: #ed8936; }
+  .method-badge.pending       .dot { background: #a0aec0; }
   .btn-row { display: flex; gap: 10px; margin-top: 14px; }
   button { cursor: pointer; border: none; border-radius: 6px; padding: 10px 22px;
            font-size: .92rem; font-weight: 600; transition: background .15s, transform .1s; }
@@ -192,15 +202,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                    letter-spacing: .5px; color: #718096; margin-bottom: 14px; }
 
   /* ── Section 1 — Classifier ── */
-  .ext-bar-wrap { margin-bottom: 16px; }
-  .ext-labels { display: flex; justify-content: space-between;
+  .tri-bar-wrap { margin-bottom: 16px; }
+  .tri-labels { display: flex; justify-content: space-between;
                 font-size: .72rem; color: #718096; margin-bottom: 4px; }
-  .ext-track { background: #e2e8f0; border-radius: 99px; height: 12px;
-               overflow: hidden; position: relative; }
-  .ext-fill  { height: 100%; background: linear-gradient(90deg,#667eea,#f6ad55);
-               border-radius: 99px; transition: width .4s ease; }
-  .ext-score-label { text-align: center; font-size: .8rem; color: #4a5568;
-                     margin-top: 5px; }
+  .tri-track { background: #e2e8f0; border-radius: 99px; height: 12px;
+               overflow: hidden; display: flex; }
+  .tri-seg   { height: 100%; transition: width .4s ease; }
+  .tri-seg.ext  { background: #38b2ac; }
+  .tri-seg.enum { background: #667eea; }
+  .tri-seg.abs  { background: #f6ad55; }
+  .tri-dominant { text-align: center; font-size: .8rem; font-weight: 600;
+                  color: #4a5568; margin-top: 5px; }
   .badges { display: flex; flex-direction: column; gap: 8px; }
   .badge { display: flex; justify-content: space-between; align-items: center;
            background: #f7fafc; border-radius: 6px; padding: 7px 12px;
@@ -278,11 +290,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <label for="query-input">Query</label>
         <input type="text" id="query-input" placeholder="Enter your query…">
       </div>
-      <div class="slider-wrap">
-        <label>Threshold</label>
-        <div class="slider-row">
-          <input type="range" id="threshold" min="0.5" max="0.99" step="0.01" value="0.85">
-          <span id="thresh-val">0.85</span>
+      <div class="method-wrap">
+        <label>Selection Method</label>
+        <div class="method-badge pending" id="method-badge">
+          <span class="dot"></span>
+          <span id="method-label">Run pipeline to see</span>
         </div>
       </div>
     </div>
@@ -300,10 +312,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <!-- 1. Classifier -->
       <div class="card">
         <div class="section-title">Classifier</div>
-        <div class="ext-bar-wrap">
-          <div class="ext-labels"><span>Abstractive</span><span>Extractive</span></div>
-          <div class="ext-track"><div class="ext-fill" id="ext-fill" style="width:50%"></div></div>
-          <div class="ext-score-label" id="ext-score-lbl">score: 0.50</div>
+        <div class="tri-bar-wrap">
+          <div class="tri-labels">
+            <span>Extractive</span><span>Enumeration</span><span>Abstractive</span>
+          </div>
+          <div class="tri-track">
+            <div class="tri-seg ext"  id="tri-ext"  style="width:33%"></div>
+            <div class="tri-seg enum" id="tri-enum" style="width:33%"></div>
+            <div class="tri-seg abs"  id="tri-abs"  style="width:34%"></div>
+          </div>
+          <div class="tri-dominant" id="tri-dominant">—</div>
         </div>
         <div class="badges">
           <div class="badge alpha">
@@ -372,11 +390,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div><!-- .container -->
 
 <script>
-// ── threshold slider live readout ────────────────────────────────────────────
-const slider   = document.getElementById('threshold');
-const threshLbl= document.getElementById('thresh-val');
-slider.addEventListener('input', () => { threshLbl.textContent = slider.value; });
-
 // ── Load Example ─────────────────────────────────────────────────────────────
 document.getElementById('btn-example').addEventListener('click', async () => {
   const res  = await fetch('/example');
@@ -389,9 +402,8 @@ document.getElementById('btn-example').addEventListener('click', async () => {
 document.getElementById('btn-compress').addEventListener('click', async () => {
   const doc   = document.getElementById('doc-input').value.trim();
   const query = document.getElementById('query-input').value.trim();
-  const thresh= parseFloat(slider.value);
 
-  if (!doc || !query) { alert('Please enter both a document and a query.'); return; }
+  if (!doc) { alert('Please enter a document.'); return; }
 
   // show spinner
   document.getElementById('spinner').classList.add('active');
@@ -401,7 +413,7 @@ document.getElementById('btn-compress').addEventListener('click', async () => {
     const res  = await fetch('/compress', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ document: doc, query, threshold: thresh }),
+      body: JSON.stringify({ document: doc, query }),
     });
     const data = await res.json();
     if (data.error) { alert('Error: ' + data.error); return; }
@@ -415,14 +427,26 @@ document.getElementById('btn-compress').addEventListener('click', async () => {
 
 // ── render ───────────────────────────────────────────────────────────────────
 function renderResults(data) {
-  // 1. Classifier
-  const ext = data.classifier.extractive_score;
-  document.getElementById('ext-fill').style.width = (ext * 100).toFixed(1) + '%';
-  document.getElementById('ext-score-lbl').textContent =
-    'extractive score: ' + ext.toFixed(4) + (ext >= 0.55 ? '  (extractive)' : ext <= 0.45 ? '  (abstractive)' : '  (mixed)');
-  document.getElementById('w-alpha').textContent = data.classifier.alpha.toFixed(4);
-  document.getElementById('w-beta').textContent  = data.classifier.beta.toFixed(4);
-  document.getElementById('w-gamma').textContent = data.classifier.gamma.toFixed(4);
+  // 1. Classifier — three-class softmax bar
+  const cl = data.classifier;
+  document.getElementById('tri-ext').style.width  = (cl.w_ext  * 100).toFixed(1) + '%';
+  document.getElementById('tri-enum').style.width = (cl.w_enum * 100).toFixed(1) + '%';
+  document.getElementById('tri-abs').style.width  = (cl.w_abs  * 100).toFixed(1) + '%';
+  const domLabels = { extractive: '⛏ Extractive', enumeration: '📋 Enumeration', abstractive: '✍ Abstractive' };
+  document.getElementById('tri-dominant').textContent =
+    (domLabels[cl.dominant] || cl.dominant) +
+    `  (ext ${cl.w_ext.toFixed(2)} / enum ${cl.w_enum.toFixed(2)} / abs ${cl.w_abs.toFixed(2)})`;
+  document.getElementById('w-alpha').textContent = cl.alpha.toFixed(4);
+  document.getElementById('w-beta').textContent  = cl.beta.toFixed(4);
+  document.getElementById('w-gamma').textContent = cl.gamma.toFixed(4);
+
+  // Selection method badge
+  const mBadge = document.getElementById('method-badge');
+  const mLabel = document.getElementById('method-label');
+  const method = data.selection_method || 'unknown';
+  mBadge.className = 'method-badge ' + (method === 'extractive' ? 'kneedle' : 'marginal');
+  const mDisplay = { extractive: '⛏ Extractive', enumeration: '📋 Enumeration', abstractive: '✍ Abstractive' };
+  mLabel.textContent = mDisplay[method] || method;
 
   // 2. Sentence list
   const sentences = data.sentences;

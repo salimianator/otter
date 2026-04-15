@@ -100,7 +100,7 @@ class QwenEvaluator:
         with torch.no_grad():
             output_ids = self._model.generate(
                 **inputs,
-                max_new_tokens=200,
+                max_new_tokens=128,
                 do_sample=False,
                 temperature=None,   # must be None when do_sample=False
                 top_p=None,         # must be None when do_sample=False
@@ -109,7 +109,17 @@ class QwenEvaluator:
 
         # Decode only the newly generated tokens (skip the prompt)
         new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-        return self._tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+        answer = self._tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+        # Free MPS/CUDA activation memory immediately after each inference
+        # call so it doesn't accumulate across benchmark examples.
+        del output_ids, new_ids, inputs
+        if self.device.type == "mps":
+            torch.mps.empty_cache()
+        elif self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return answer
 
 
 # ---------------------------------------------------------------------------

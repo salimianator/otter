@@ -37,13 +37,17 @@ class QueryPlanner:
 
     def __init__(
         self,
-        anchor_sentences: int = 2,
-        flow_window: int = 2,
-        flow_decay: float = 0.6,
+        anchor_sentences: int   = 2,
+        flow_window:      int   = 2,
+        flow_decay:       float = 0.6,
+        min_keep_ratio:   float = 0.25,  # never keep fewer than 25% of sentences
+        enum_decay:       float = 0.70,  # default running-mean decay (overridden by classifier)
     ) -> None:
         self.anchor_sentences = anchor_sentences
         self.flow_window      = flow_window
         self.flow_decay       = flow_decay
+        self.min_keep_ratio   = min_keep_ratio
+        self.enum_decay       = enum_decay
 
     # ------------------------------------------------------------------
     # Public API
@@ -136,19 +140,86 @@ class QueryPlanner:
             "combined": combined,
         }
 
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _unified_cutoff(
+        self,
+        scores_ranked: np.ndarray,
+        floor_ratio:   float,
+        enum_decay:    float,
+    ) -> int:
+        """
+        Continuously-blended selection cutoff driven by classifier weights.
+
+        Blends two complementary signals:
+
+        Step 1 — Running-mean decay (enumeration/extractive precision):
+            Keep adding sentences while each next score stays above
+            enum_decay × current running mean.  Stops at the first
+            sentence that pulls quality meaningfully below the group mean.
+
+        Step 2 — Marginal floor (abstractive breadth):
+            Keep all sentences above floor_ratio × global mean.
+            Designed for flat distributions where precision cutoff
+            fires too early.
+
+        Step 3 — Blend proportional to floor_ratio:
+            Low floor_ratio  → decay_cutoff dominates (extractive)
+            High floor_ratio → floor_cutoff dominates (abstractive)
+            Middle           → balanced blend            (enumeration)
+
+        Returns
+        -------
+        int
+            Cutoff index into scores_ranked (number of sentences to keep).
+        """
+        N = len(scores_ranked)
+
+        # Step 1 — running-mean decay
+        kept_scores  = [scores_ranked[0]]
+        decay_cutoff = N
+        for i in range(1, N):
+            running_mean = np.mean(kept_scores)
+            if scores_ranked[i] >= running_mean * enum_decay:
+                kept_scores.append(scores_ranked[i])
+            else:
+                decay_cutoff = i
+                break
+
+        # Step 2 — global marginal floor
+        mean_score   = np.mean(scores_ranked)
+        floor        = floor_ratio * mean_score
+        floor_cutoff = next(
+            (i for i, s in enumerate(scores_ranked) if s < floor),
+            N,
+        )
+
+        # Step 3 — blend
+        cutoff = int(round(
+            (1 - floor_ratio) * decay_cutoff +
+            floor_ratio       * floor_cutoff
+        ))
+        return max(1, cutoff)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def select(
         self,
         sentences: list[str],
-        scores:    np.ndarray,       # [N,] combined array from score()["combined"]
-        threshold: float = 0.85,
+        scores:    np.ndarray,  # [N,] combined array from score()["combined"]
+        weights:   dict,        # full weights dict from QueryClassifier.get_weights()
     ) -> list[str]:
         """
-        Select sentences via cumulative-score thresholding.
+        Select sentences using continuously-interpolated selection.
 
-        Sentences are ranked by score descending; we keep adding until
-        their cumulative score reaches ``threshold`` × total score.
-        Kept indices are then sorted back into *document order* so the
-        LLM receives a chronologically coherent passage.
+        The classifier's softmax weights (w_ext / w_enum / w_abs) are used
+        to interpolate floor_ratio and enum_decay, which in turn control
+        how precisely vs. broadly sentences are kept.  No hard switching —
+        every query gets a blend of all three strategies.
 
         Parameters
         ----------
@@ -156,28 +227,47 @@ class QueryPlanner:
             Original ordered sentence list.
         scores : np.ndarray, shape [N,]
             Per-sentence combined scores from :meth:`score`.
-        threshold : float
-            Fraction of total score to capture (default: 0.85).
+        weights : dict
+            Output of QueryClassifier.get_weights() — must contain
+            'floor_ratio', 'enum_decay', and 'dominant'.
 
         Returns
         -------
         list[str]
-            Subset of sentences in their original document order.
+            Kept sentences in their original document order.
         """
         N = len(scores)
         if N == 0:
             return []
 
-        ranked_idx  = np.argsort(scores)[::-1]          # high → low
-        cumsum      = np.cumsum(scores[ranked_idx])
-        total_score = cumsum[-1]
+        floor_ratio = float(weights["floor_ratio"])
+        enum_decay  = float(weights["enum_decay"])
+        dominant    = weights["dominant"]
 
-        # Find the minimum number of sentences that covers the threshold
-        cutoff_pos  = int(np.searchsorted(cumsum, threshold * total_score))
-        cutoff_pos  = min(cutoff_pos, N - 1)             # clamp
+        # (a) Minimum keep count
+        min_keep = max(3, int(N * self.min_keep_ratio))
 
-        kept_idx = sorted(ranked_idx[: cutoff_pos + 1].tolist())   # doc order
-        return [sentences[i] for i in kept_idx]
+        # (b) Rank descending
+        ranked_indices = np.argsort(scores)[::-1]
+        scores_ranked  = scores[ranked_indices]
+
+        # (c) Unified blended cutoff
+        cutoff = self._unified_cutoff(scores_ranked, floor_ratio, enum_decay)
+
+        # (d) Apply minimum keep floor
+        cutoff = max(cutoff, min_keep)
+
+        # (e–f) Collect and restore document order
+        kept_ranked         = ranked_indices[:cutoff]
+        kept_original_order = sorted(kept_ranked.tolist())
+
+        print(
+            f'[planner] dominant={dominant} | '
+            f'floor={floor_ratio:.2f} | decay={enum_decay:.2f} | '
+            f'cutoff={cutoff}/{N}'
+        )
+
+        return [sentences[i] for i in kept_original_order]
 
 
 # ---------------------------------------------------------------------------
@@ -191,88 +281,64 @@ if __name__ == "__main__":
 
     sys.path.insert(0, str(Path(__file__).parent))
 
-    from segmenter   import SentenceSegmenter
-    from encoder     import SentenceEncoder
-    from classifier  import QueryClassifier
+    from segmenter  import SentenceSegmenter
+    from encoder    import SentenceEncoder
+    from classifier import QueryClassifier
 
-    DATA_PATH = Path(__file__).parent.parent / "data" / "longbench_qasper.jsonl"
+    DATA_DIR = Path(__file__).parent.parent / "data"
 
-    # Load first example
-    with open(DATA_PATH, "r", encoding="utf-8") as f:
-        record = json.loads(f.readline())
-
-    context = record["context"]
-    query   = record["input"]
-
-    # --- Step 1: segment ---
     segmenter  = SentenceSegmenter(min_words=6)
-    sentences  = segmenter.segment(context)
-
-    # --- Step 2: encode ---
     encoder    = SentenceEncoder()
-    sent_vecs  = encoder.encode(sentences)
-
-    # --- Step 3: classify → weights ---
     classifier = QueryClassifier(encoder)
-    weights    = classifier.get_weights(query)
-
-    # --- Step 4: score + select (query string passed directly) ---
-    planner   = QueryPlanner()
-    score_d   = planner.score(sent_vecs, query, weights)
-    kept      = planner.select(sentences, score_d["combined"], threshold=0.85)
-
-    ratio = len(kept) / len(sentences)
-
-    print("=" * 66)
-    print("OTTER end-to-end pipeline — first qasper example")
-    print("=" * 66)
-    print(f"Query              : {query!r}")
-    print()
-    print(f"Classifier weights :")
-    print(f"  extractive_score = {weights['extractive_score']:.4f}")
-    print(f"  alpha (Anchor)   = {weights['alpha']:.4f}")
-    print(f"  beta  (Flow)     = {weights['beta']:.4f}")
-    print(f"  gamma (Flash)    = {weights['gamma']:.4f}")
-    print()
-    print(f"Sentences before   : {len(sentences)}")
-    print(f"Sentences after    : {len(kept)}")
-    print(f"Compression ratio  : {ratio:.2%}  ({len(kept)}/{len(sentences)} kept)")
-
-    print("\n--- First 5 kept sentences ---")
-    for i, s in enumerate(kept[:5]):
-        print(f"  [{i}] {s}")
-
-    print("\n--- Last 5 kept sentences ---")
-    for i, s in enumerate(kept[-5:], start=len(kept) - 5):
-        print(f"  [{i}] {s}")
+    planner    = QueryPlanner()
 
     # -----------------------------------------------------------------------
-    # Multi-part query validation — per-sub-query top-5
+    # Datasets: qasper → should trigger Kneedle (extractive)
+    #           qmsum  → should trigger marginal_return (abstractive)
     # -----------------------------------------------------------------------
-    MULTI_QUERY = (
-        "What is the main contribution? "
-        "Who are the primary authors?"
-    )
-
-    print("\n" + "=" * 66)
-    print("Multi-part query — per-sub-query top-5 validation")
-    print("=" * 66)
-    print(f"Query: {MULTI_QUERY!r}\n")
-
-    query_mat = encoder.encode_query_multi(MULTI_QUERY)   # [K, 384]
-    print(f"Sub-queries detected: {query_mat.shape[0]}")
-    print(f"Query matrix shape  : {query_mat.shape}\n")
-
-    flash_per_q = sent_vecs @ query_mat.T                 # [N, K]
-
-    sub_labels = [
-        "What is the main contribution?",
-        "Who are the primary authors?",
+    SUITES = [
+        ("qasper", "longbench_qasper.jsonl"),
+        ("qmsum",  "longbench_qmsum.jsonl"),
     ]
-    for k, label in enumerate(sub_labels[:query_mat.shape[0]]):
-        col = flash_per_q[:, k]
-        top5 = np.argsort(col)[::-1][:5]
-        print(f"  Sub-query {k+1}: {label!r}")
-        for rank, idx in enumerate(top5, 1):
-            print(f"    Rank {rank} | score {col[idx]:.3f} | {sentences[idx][:90]}")
-        print()
+
+    for subset_name, filename in SUITES:
+        data_path = DATA_DIR / filename
+        if not data_path.exists():
+            print(f"\n[SKIP] {filename} not found — run benchmark.py to download first.")
+            continue
+
+        print("\n" + "=" * 66)
+        print(f"Subset: {subset_name.upper()} — 3 examples")
+        print("=" * 66)
+
+        with open(data_path, "r", encoding="utf-8") as fh:
+            records = [json.loads(fh.readline()) for _ in range(3)]
+
+        for ex_idx, record in enumerate(records, 1):
+            context = record["context"]
+            query   = record["input"]
+
+            # Apply same fallback as compress.py
+            if not query or not query.strip():
+                query = "Summarize the main points of this document."
+
+            sentences = segmenter.segment(context)
+            sent_vecs = encoder.encode(sentences)
+            weights   = classifier.get_weights(query)
+            score_d   = planner.score(sent_vecs, query, weights)
+
+            kept = planner.select(
+                sentences=sentences,
+                scores=score_d["combined"],
+                weights=weights,
+            )
+
+            ratio  = len(kept) / max(len(sentences), 1)
+            q_disp = (query[:57] + "…") if len(query) > 60 else query
+
+            print(
+                f"  [{ex_idx}] query={q_disp!r}\n"
+                f"       dominant={weights['dominant']:<13}  "
+                f"floor={weights['floor_ratio']:.2f}  decay={weights['enum_decay']:.2f}  "
+                f"kept={len(kept)}/{len(sentences)}  ratio={ratio:.1%}"
+            )
