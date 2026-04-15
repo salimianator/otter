@@ -17,6 +17,8 @@ Usage — repeated calls (models loaded once):
 
 from __future__ import annotations
 
+import numpy as np
+
 from segmenter  import SentenceSegmenter
 from encoder    import SentenceEncoder
 from classifier import QueryClassifier
@@ -92,20 +94,24 @@ class OTTERCompressor:
         # Guard: empty query (e.g. multi_news has no input field) — substitute a
         # generic abstractive prompt so Flash scoring gets a meaningful query
         # vector rather than near-zero cosine similarities across all sentences.
+        SUBSTITUTED_QUERY = "Summarize the main points of this document."
+        query_was_substituted = False
         if not query or not query.strip():
-            query = "Summarize the main points of this document."
+            query = SUBSTITUTED_QUERY
+            query_was_substituted = True
 
         # (a) Segment
         sentences = self.segmenter.segment(document)
         if not sentences:
             return {
-                "compressed":          "",
-                "original_sentences":  0,
-                "kept_sentences":      0,
-                "compression_ratio":   0.0,
-                "token_reduction_pct": 0.0,
-                "weights":             {},
-                "scores":              {},
+                "compressed":            "",
+                "original_sentences":    0,
+                "kept_sentences":        0,
+                "compression_ratio":     0.0,
+                "token_reduction_pct":   0.0,
+                "weights":               {},
+                "scores":                {},
+                "query_was_substituted": query_was_substituted,
             }
 
         # (b) Encode
@@ -128,19 +134,30 @@ class OTTERCompressor:
             weights=weights,
         )
 
+        # (e2) Coverage floor for substituted queries (e.g. multi_news)
+        # Never keep fewer than 55% of sentences when there is no real query —
+        # the top 55% by score is still relevance-ranked, not random.
+        if query_was_substituted:
+            min_coverage = int(len(sentences) * 0.55)
+            if len(kept_sentences) < min_coverage:
+                ranked_indices = list(np.argsort(score_dict["combined"])[::-1])
+                top_indices    = sorted(ranked_indices[:min_coverage])
+                kept_sentences = [sentences[i] for i in top_indices]
+
         # (f) Assemble
         compressed_text = " ".join(kept_sentences)
 
         # (g) Return
         return {
-            "compressed":          compressed_text,
-            "original_sentences":  len(sentences),
-            "kept_sentences":      len(kept_sentences),
-            "compression_ratio":   len(kept_sentences) / len(sentences),
-            "token_reduction_pct": (1 - len(kept_sentences) / len(sentences)) * 100,
-            "weights":             weights,
-            "scores":              score_dict,
-            "selection_method":    weights["dominant"],
+            "compressed":            compressed_text,
+            "original_sentences":    len(sentences),
+            "kept_sentences":        len(kept_sentences),
+            "compression_ratio":     len(kept_sentences) / len(sentences),
+            "token_reduction_pct":   (1 - len(kept_sentences) / len(sentences)) * 100,
+            "weights":               weights,
+            "scores":                score_dict,
+            "selection_method":      weights["dominant"],
+            "query_was_substituted": query_was_substituted,
         }
 
 

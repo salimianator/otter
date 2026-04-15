@@ -124,7 +124,7 @@ class QueryClassifier:
         gamma = w_ext * 0.90 + w_enum * 0.70 + w_abs * 0.40
 
         # Interpolate selection parameters
-        floor_ratio = w_ext * 0.15 + w_enum * 0.30 + w_abs * 0.60
+        floor_ratio = w_ext * 0.15 + w_enum * 0.30 + w_abs * 0.85
         enum_decay  = w_ext * 0.50 + w_enum * 0.70 + w_abs * 0.90
 
         # Dominant class label
