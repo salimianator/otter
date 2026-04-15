@@ -1,4 +1,4 @@
-# OTTER — Optimised Token-Text Encoder & Retrieval
+# OTTER — Open Training-free Text Encoder and Retrieval 
 
 OTTER is a prompt compression research project that reduces long-context inputs
 before they reach an LLM reader, preserving task-relevant information while
