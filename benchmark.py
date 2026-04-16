@@ -144,8 +144,8 @@ def run_benchmark(
     Path
         Path to the output JSONL file.
     """
-    if mode not in {"otter", "baseline"}:
-        raise ValueError(f"mode must be 'otter' or 'baseline', got {mode!r}")
+    if mode not in {"otter", "baseline", "beaver"}:
+        raise ValueError(f"mode must be 'otter', 'baseline', or 'beaver', got {mode!r}")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     output_path = RESULTS_DIR / f"{mode}_{subset}.jsonl"
@@ -179,6 +179,27 @@ def run_benchmark(
 
     print("Loading Qwen2.5-3B-Instruct …")
     evaluator = QwenEvaluator(load_on_init=True)
+
+    # BEAVER shares the already-loaded Qwen model — no second load.
+    beaver_wrapper = None
+    if mode == "beaver":
+        sys.path.insert(0, str(ROOT / "beaver"))
+        from Wrapper import HSPBlackBoxWrapper, HSPWrapperConfig   # noqa: E402
+        print("Initialising BEAVER wrapper (shares Qwen model) …")
+        beaver_cfg = HSPWrapperConfig(
+            page_size=64,
+            anchor_pages=4,
+            flow_window=4,
+            flash_top_k=22,
+            allow_implicit_query=True,   # handles empty queries (e.g. multi_news)
+        )
+        beaver_wrapper = HSPBlackBoxWrapper(
+            model=evaluator._model,
+            tokenizer=evaluator._tokenizer,
+            cfg=beaver_cfg,
+            device=evaluator.device,     # passes MPS device explicitly
+        )
+        print("BEAVER ready.")
 
     metric       = select_metric(subset)
     metric_label = metric.upper()
@@ -239,6 +260,37 @@ def run_benchmark(
                     f" | removed_for_cap={result['removed_for_cap']}"
                     f" | floor_applied={result['multi_doc_floor_applied']}"
                 )
+
+            elif mode == "beaver":
+                # BEAVER compresses at the token level using Qwen's own embeddings.
+                # We decode the kept context tokens back to text so that generation
+                # goes through the same evaluator.answer() prompt format as OTTER,
+                # making the comparison fair.
+                import torch as _torch
+                input_ids, attention_mask, explicit_qp = (
+                    beaver_wrapper._build_inputs_from_texts([context], [query or ""])
+                )
+                _, beaver_stats = beaver_wrapper.compress_inputs_for_prefill(
+                    input_ids, attention_mask, explicit_qp
+                )
+                kept_indices = beaver_stats["kept_context_token_indices"][0]
+                if kept_indices:
+                    kept_ids  = input_ids[0][_torch.tensor(kept_indices, dtype=_torch.long,
+                                                            device=input_ids.device)]
+                    input_text = beaver_wrapper.tokenizer.decode(
+                        kept_ids.tolist(), skip_special_tokens=True
+                    )
+                else:
+                    input_text = context   # fallback: no compression
+
+                compression_ratio = beaver_stats["compression_ratio"]
+                token_reduction   = (1 - compression_ratio) * 100
+                print(
+                    f"  [beaver] original_tokens={beaver_stats['original_len']}"
+                    f" | compressed_tokens={beaver_stats['compressed_len']}"
+                    f" | ratio={compression_ratio:.2%}"
+                )
+
             else:
                 input_text        = context
                 compression_ratio = 1.0
@@ -410,7 +462,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--subset",     default="qasper",
                    help="LongBench subset name")
-    p.add_argument("--mode",       default="otter", choices=["otter", "baseline"],
+    p.add_argument("--mode",       default="otter", choices=["otter", "baseline", "beaver"],
                    help="Compression mode")
     p.add_argument("--max",        type=int, default=None, dest="max_examples",
                    help="Maximum number of examples to run (None = all)")

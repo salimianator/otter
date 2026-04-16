@@ -25,6 +25,9 @@ build/
 # Outputs (generated, not tracked)
 outputs/
 
+# BEAVER — cloned separately, not tracked here (has its own git repo)
+beaver/
+
 # macOS
 .DS_Store
 
