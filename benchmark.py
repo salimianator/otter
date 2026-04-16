@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,32 @@ def truncate_to_token_limit(text: str, max_words: int = MAX_WORDS) -> str:
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words])
+
+
+def split_passages(context: str) -> list[str]:
+    """
+    Split a multi_news context string into individual passage strings.
+
+    multi_news contexts are formatted as:
+        "Passage 1:\\ntext...\\nPassage 2:\\ntext..."
+    with literal "NEWLINE_CHAR" standing in for newlines within each passage.
+
+    Returns a list of clean passage strings (header stripped, newlines restored).
+    Returns [context] unchanged for any context that contains no passage headers.
+    """
+    parts = re.split(r"(?=Passage \d+:\n)", context)
+    passages = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Strip the "Passage N:\n" header
+        part = re.sub(r"^Passage \d+:\n", "", part)
+        # Restore literal newlines
+        part = part.replace("NEWLINE_CHAR", "\n").strip()
+        if part:
+            passages.append(part)
+    return passages if len(passages) > 1 else [context]
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -191,10 +218,26 @@ def run_benchmark(
 
             # (b) Compress or pass through
             if mode == "otter":
-                result            = compressor.compress(context, query)
+                # multi_news: split "Passage N:" context into separate documents
+                # so the multi-doc path (cross-doc scoring, coverage floor,
+                # centroid anchor) is exercised.
+                if subset == "multi_news":
+                    passages = split_passages(context)
+                    result   = compressor.compress("", query, documents=passages)
+                else:
+                    result   = compressor.compress(context, query)
+
                 input_text        = result["compressed"]
                 compression_ratio = result["compression_ratio"]
                 token_reduction   = result["token_reduction_pct"]
+
+                # Print multi-doc diagnostics so they're visible in the terminal
+                print(
+                    f"  [multi-doc] n_passages={len(passages) if subset == 'multi_news' else 1}"
+                    f" | cross_doc_weight={result['cross_doc_weight']}"
+                    f" | used_synthetic_anchor={result['used_synthetic_anchor']}"
+                    f" | added_for_floor={result['added_for_floor']}"
+                )
             else:
                 input_text        = context
                 compression_ratio = 1.0
