@@ -236,7 +236,7 @@ def run_benchmark(
                     f"  [multi-doc] n_passages={len(passages) if subset == 'multi_news' else 1}"
                     f" | cross_doc_weight={result['cross_doc_weight']}"
                     f" | used_synthetic_anchor={result['used_synthetic_anchor']}"
-                    f" | added_for_floor={result['added_for_floor']}"
+                    f" | removed_for_cap={result['removed_for_cap']}"
                 )
             else:
                 input_text        = context
@@ -272,9 +272,9 @@ def run_benchmark(
                 "rouge_l":             round(rouge_l, 4) if rouge_l is not None else None,
                 "latency_s":           round(latency, 2),
                 # Multi-doc metadata — None / False / 0 for single-doc runs
-                "cross_doc_weight":      result.get("cross_doc_weight")      if mode == "otter" else None,
-                "used_synthetic_anchor": result.get("used_synthetic_anchor", False) if mode == "otter" else False,
-                "added_for_floor":       result.get("added_for_floor", 0)    if mode == "otter" else 0,
+                "cross_doc_weight":      result.get("cross_doc_weight")           if mode == "otter" else None,
+                "used_synthetic_anchor": result.get("used_synthetic_anchor", False)  if mode == "otter" else False,
+                "removed_for_cap":       result.get("removed_for_cap", 0)            if mode == "otter" else 0,
             }
 
             # (f) Append immediately

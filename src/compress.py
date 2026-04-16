@@ -49,17 +49,24 @@ class OTTERCompressor:
     encoder_model : str
         HuggingFace sentence-transformer model ID.
     cross_doc_weight : float
-        Weight for cross-document correlation bonus (multi-doc only, default: 0.3).
+        Base cross-doc correlation weight (extractive end, default: 0.3).
+    cross_doc_weight_abs : float
+        Cross-doc weight ceiling for purely abstractive queries (default: 0.6).
+    per_doc_cap_ratio : float
+        Max fraction of kept-sentence budget any single document may occupy
+        (default: 0.6).  Excess sentences evicted lowest-score-first.
     """
 
     def __init__(
         self,
-        anchor_sentences:  int   = 2,
-        flow_window:       int   = 2,
-        flow_decay:        float = 0.6,
-        min_words:         int   = 6,
-        encoder_model:     str   = "sentence-transformers/all-MiniLM-L6-v2",
-        cross_doc_weight:  float = 0.3,
+        anchor_sentences:     int   = 2,
+        flow_window:          int   = 2,
+        flow_decay:           float = 0.6,
+        min_words:            int   = 6,
+        encoder_model:        str   = "sentence-transformers/all-MiniLM-L6-v2",
+        cross_doc_weight:     float = 0.3,
+        cross_doc_weight_abs: float = 0.6,
+        per_doc_cap_ratio:    float = 0.6,
     ) -> None:
         self.segmenter  = SentenceSegmenter(min_words=min_words)
         self.encoder    = SentenceEncoder(model_name=encoder_model)
@@ -69,6 +76,8 @@ class OTTERCompressor:
             flow_window=flow_window,
             flow_decay=flow_decay,
             cross_doc_weight=cross_doc_weight,
+            cross_doc_weight_abs=cross_doc_weight_abs,
+            per_doc_cap_ratio=per_doc_cap_ratio,
         )
 
     def compress(
@@ -229,8 +238,8 @@ class OTTERCompressor:
             # Multi-doc metadata (None / False / 0 for single-doc)
             "cross_doc_weight":      score_dict["cross_doc_weight"] if is_multi_doc else None,
             "used_synthetic_anchor": score_dict["used_synthetic_anchor"],
-            "per_doc_floor_applied": select_meta["per_doc_floors_applied"],
-            "added_for_floor":       select_meta["added_for_floor"],
+            "per_doc_cap_applied":   select_meta["per_doc_cap_applied"],
+            "removed_for_cap":       select_meta["removed_for_cap"],
         }
 
 

@@ -36,26 +36,39 @@ class QueryPlanner:
         Base bonus for distance-1 neighbours.  Distance-2 neighbours
         receive ``flow_decay * 0.5``.  Default: 0.6  →  d1=0.6, d2=0.3.
     cross_doc_weight : float
-        Weight for the cross-document correlation bonus added to the
-        combined score when multiple documents are present (default: 0.3).
-        Only applied when ``doc_boundaries`` contains more than one entry.
+        Base weight for the cross-document correlation bonus (default: 0.3).
+        Interpolated upward toward ``cross_doc_weight_abs`` for abstractive
+        queries; only applied when ``doc_boundaries`` contains more than one entry.
+    cross_doc_weight_abs : float
+        Cross-doc weight ceiling for purely abstractive queries (default: 0.6).
+        Linearly interpolated with ``cross_doc_weight`` using the classifier's
+        ``w_abs`` score so summarisation tasks get a stronger cross-doc signal.
+    per_doc_cap_ratio : float
+        Maximum fraction of the total kept-sentence budget that any single
+        document may occupy (default: 0.6).  Excess sentences are evicted
+        lowest-score-first so under-represented documents get implicit headroom.
+        Only applied in multi-doc mode.
     """
 
     def __init__(
         self,
-        anchor_sentences:  int   = 2,
-        flow_window:       int   = 2,
-        flow_decay:        float = 0.6,
-        min_keep_ratio:    float = 0.25,  # never keep fewer than 25% of sentences
-        enum_decay:        float = 0.70,  # default running-mean decay (overridden by classifier)
-        cross_doc_weight:  float = 0.3,   # cross-document correlation weight (multi-doc only)
+        anchor_sentences:     int   = 2,
+        flow_window:          int   = 2,
+        flow_decay:           float = 0.6,
+        min_keep_ratio:       float = 0.25,  # never keep fewer than 25% of sentences
+        enum_decay:           float = 0.70,  # default running-mean decay (overridden by classifier)
+        cross_doc_weight:     float = 0.3,   # cross-doc base weight (extractive end)
+        cross_doc_weight_abs: float = 0.6,   # cross-doc ceiling (abstractive end)
+        per_doc_cap_ratio:    float = 0.6,   # max fraction of kept budget per document
     ) -> None:
-        self.anchor_sentences = anchor_sentences
-        self.flow_window      = flow_window
-        self.flow_decay       = flow_decay
-        self.min_keep_ratio   = min_keep_ratio
-        self.enum_decay       = enum_decay
-        self.cross_doc_weight = cross_doc_weight
+        self.anchor_sentences     = anchor_sentences
+        self.flow_window          = flow_window
+        self.flow_decay           = flow_decay
+        self.min_keep_ratio       = min_keep_ratio
+        self.enum_decay           = enum_decay
+        self.cross_doc_weight     = cross_doc_weight
+        self.cross_doc_weight_abs = cross_doc_weight_abs
+        self.per_doc_cap_ratio    = per_doc_cap_ratio
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -231,7 +244,14 @@ class QueryPlanner:
             ``used_synthetic_anchor``– bool, True when anchor_embedding was injected
         """
         if cross_doc_weight is None:
-            cross_doc_weight = self.cross_doc_weight
+            # Interpolate between base and abstractive ceiling using w_abs
+            # from the classifier.  Summarisation tasks (w_abs → 1) get a
+            # stronger cross-doc signal; extractive tasks stay near the base.
+            w_abs = float(weights.get("w_abs", 0.0))
+            cross_doc_weight = (
+                self.cross_doc_weight
+                + w_abs * (self.cross_doc_weight_abs - self.cross_doc_weight)
+            )
 
         n_docs = len(doc_boundaries) if doc_boundaries is not None else 1
 
@@ -252,11 +272,25 @@ class QueryPlanner:
         N = len(embeddings)
 
         # (a) Anchor scores ------------------------------------------------
-        anchor   = np.zeros(N, dtype=np.float32)
-        n_anchor = min(self.anchor_sentences, N)
-        anchor[:n_anchor] = 1.0
-        if N > n_anchor:                              # avoid double-setting
-            anchor[max(N - n_anchor, n_anchor):] = 1.0
+        anchor = np.zeros(N, dtype=np.float32)
+        if doc_boundaries is not None and n_docs > 1:
+            # Multi-doc: apply anchor independently per document so every
+            # article's opening and closing sentences are force-kept, not
+            # just the start/end of the concatenated sentence list.
+            _starts = [0] + list(doc_boundaries[:-1])
+            _ends   = list(doc_boundaries)
+            for _s, _e in zip(_starts, _ends):
+                _n  = _e - _s
+                _na = min(self.anchor_sentences, _n)
+                anchor[_s:_s + _na] = 1.0
+                if _n > _na:
+                    anchor[max(_e - _na, _s + _na):_e] = 1.0
+        else:
+            # Single-doc: original behaviour (unchanged)
+            n_anchor = min(self.anchor_sentences, N)
+            anchor[:n_anchor] = 1.0
+            if N > n_anchor:                          # avoid double-setting
+                anchor[max(N - n_anchor, n_anchor):] = 1.0
 
         # (b) Flash scores -------------------------------------------------
         # [N x K] similarity matrix — each column is one sub-query's scores.
@@ -341,12 +375,12 @@ class QueryPlanner:
         tuple[list[str], dict]
             - Kept sentences in their original document order.
             - Metadata dict with keys:
-                ``per_doc_floors_applied`` – bool, True when floor was enforced
-                ``added_for_floor``        – int, sentences added by coverage floor
+                ``per_doc_cap_applied`` – bool, True when cap was enforced
+                ``removed_for_cap``    – int, sentences evicted by coverage cap
         """
         N = len(scores)
         if N == 0:
-            return [], {"per_doc_floors_applied": False, "added_for_floor": 0}
+            return [], {"per_doc_cap_applied": False, "removed_for_cap": 0}
 
         floor_ratio = float(weights["floor_ratio"])
         enum_decay  = float(weights["enum_decay"])
@@ -368,28 +402,30 @@ class QueryPlanner:
         # (e) Build kept set
         kept_set = set(ranked_indices[:cutoff].tolist())
 
-        # (f) Per-doc coverage floor — multi-doc only (Change 2) ----------
-        added_for_floor        = 0
-        per_doc_floors_applied = False
+        # (f) Per-doc coverage cap — multi-doc only -----------------------
+        # No single document may contribute more than per_doc_cap_ratio of
+        # the total kept budget.  Excess sentences are evicted lowest-score-
+        # first, giving implicit headroom to under-represented documents.
+        removed_for_cap     = 0
+        per_doc_cap_applied = False
         n_docs = len(doc_boundaries) if doc_boundaries is not None else 1
 
         if doc_boundaries is not None and n_docs > 1:
-            per_doc_floors_applied = True
-            global_kept_fraction   = cutoff / N
+            per_doc_cap_applied = True
+            max_per_doc = max(1, int(np.floor(self.per_doc_cap_ratio * len(kept_set))))
             starts = [0] + list(doc_boundaries[:-1])
             ends   = list(doc_boundaries)
 
             for d_start, d_end in zip(starts, ends):
-                n_in_doc       = d_end - d_start
-                required       = int(np.floor(global_kept_fraction * n_in_doc))
-                currently_kept = sum(1 for i in range(d_start, d_end) if i in kept_set)
-                deficit        = required - currently_kept
-                if deficit > 0:
-                    not_kept        = [i for i in range(d_start, d_end) if i not in kept_set]
-                    not_kept_sorted = sorted(not_kept, key=lambda i: -scores[i])
-                    for i in not_kept_sorted[:deficit]:
-                        kept_set.add(i)
-                        added_for_floor += 1
+                doc_kept = sorted(
+                    [i for i in range(d_start, d_end) if i in kept_set],
+                    key=lambda i: scores[i],   # ascending: lowest score first
+                )
+                excess = len(doc_kept) - max_per_doc
+                if excess > 0:
+                    for i in doc_kept[:excess]:
+                        kept_set.discard(i)
+                        removed_for_cap += 1
 
         # (g) Restore document order
         kept_original_order = sorted(kept_set)
@@ -398,12 +434,12 @@ class QueryPlanner:
             f'[planner] dominant={dominant} | '
             f'floor={floor_ratio:.2f} | decay={enum_decay:.2f} | '
             f'cutoff={cutoff}/{N}'
-            + (f' | added_for_floor={added_for_floor}' if per_doc_floors_applied else '')
+            + (f' | removed_for_cap={removed_for_cap}' if per_doc_cap_applied else '')
         )
 
         meta = {
-            "per_doc_floors_applied": per_doc_floors_applied,
-            "added_for_floor":        added_for_floor,
+            "per_doc_cap_applied": per_doc_cap_applied,
+            "removed_for_cap":     removed_for_cap,
         }
         return [sentences[i] for i in kept_original_order], meta
 
@@ -523,10 +559,10 @@ if __name__ == "__main__":
     )
 
     print(f"\nQuery : {query_2doc!r}")
-    print(f"  cross_doc_weight      = {score_2doc['cross_doc_weight']}")
+    print(f"  cross_doc_weight      = {score_2doc['cross_doc_weight']:.3f}")
     print(f"  used_synthetic_anchor = {score_2doc['used_synthetic_anchor']}")
-    print(f"  per_doc_floors_applied= {meta_2doc['per_doc_floors_applied']}")
-    print(f"  added_for_floor       = {meta_2doc['added_for_floor']}")
+    print(f"  per_doc_cap_applied   = {meta_2doc['per_doc_cap_applied']}")
+    print(f"  removed_for_cap       = {meta_2doc['removed_for_cap']}")
     print(f"\n  {'idx':>4}  {'doc':>3}  {'combined':>9}  {'cross_doc':>9}  sentence[:60]")
     print("  " + "-" * 85)
     for i, s in enumerate(all_sents_2doc):
@@ -567,7 +603,7 @@ if __name__ == "__main__":
     cross_doc_all_zero = bool(np.all(score_1doc["cross_doc"] == 0.0))
     print(f"\n  cross_doc all zeros   = {cross_doc_all_zero}  (expect True)")
     print(f"  used_synthetic_anchor = {score_1doc['used_synthetic_anchor']}  (expect False)")
-    print(f"  per_doc_floors_applied= {meta_1doc['per_doc_floors_applied']}  (expect False)")
+    print(f"  per_doc_cap_applied   = {meta_1doc['per_doc_cap_applied']}  (expect False)")
     print(f"\n  {'idx':>4}  {'combined':>9}  {'cross_doc':>9}  sentence[:60]")
     print("  " + "-" * 75)
     for i, s in enumerate(DOC1_SENTS):
@@ -580,7 +616,7 @@ if __name__ == "__main__":
         )
     print(f"\n  Kept {len(kept_1doc)}/{len(DOC1_SENTS)} sentences")
 
-    if cross_doc_all_zero and not score_1doc["used_synthetic_anchor"] and not meta_1doc["per_doc_floors_applied"]:
+    if cross_doc_all_zero and not score_1doc["used_synthetic_anchor"] and not meta_1doc["per_doc_cap_applied"]:
         print("\n  [OK] Single-doc: all multi-doc paths skipped — behaviour identical to pre-change.")
     else:
         print("\n  [FAIL] Single-doc path triggered multi-doc logic unexpectedly.")
@@ -612,8 +648,8 @@ if __name__ == "__main__":
     )
 
     print(f"\n  used_synthetic_anchor = {score_anc['used_synthetic_anchor']}  (expect True)")
-    print(f"  per_doc_floors_applied= {meta_anc['per_doc_floors_applied']}  (expect True)")
-    print(f"  added_for_floor       = {meta_anc['added_for_floor']}")
+    print(f"  per_doc_cap_applied   = {meta_anc['per_doc_cap_applied']}  (expect True)")
+    print(f"  removed_for_cap       = {meta_anc['removed_for_cap']}")
     print(f"\n  {'idx':>4}  {'doc':>3}  {'combined':>9}  {'cross_doc':>9}  sentence[:60]")
     print("  " + "-" * 85)
     for i, s in enumerate(all_sents_2doc):
