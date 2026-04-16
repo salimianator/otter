@@ -13,6 +13,10 @@ Usage — repeated calls (models loaded once):
     compressor = OTTERCompressor()
     for doc, q in pairs:
         result = compressor.compress(doc, q)
+
+Multi-document usage:
+    result = compressor.compress(document="", query=q,
+                                 documents=["doc1 text", "doc2 text"])
 """
 
 from __future__ import annotations
@@ -44,15 +48,18 @@ class OTTERCompressor:
         Minimum words per segment before merging (default: 6).
     encoder_model : str
         HuggingFace sentence-transformer model ID.
+    cross_doc_weight : float
+        Weight for cross-document correlation bonus (multi-doc only, default: 0.3).
     """
 
     def __init__(
         self,
-        anchor_sentences: int = 2,
-        flow_window: int = 2,
-        flow_decay: float = 0.6,
-        min_words: int = 6,
-        encoder_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        anchor_sentences:  int   = 2,
+        flow_window:       int   = 2,
+        flow_decay:        float = 0.6,
+        min_words:         int   = 6,
+        encoder_model:     str   = "sentence-transformers/all-MiniLM-L6-v2",
+        cross_doc_weight:  float = 0.3,
     ) -> None:
         self.segmenter  = SentenceSegmenter(min_words=min_words)
         self.encoder    = SentenceEncoder(model_name=encoder_model)
@@ -61,47 +68,87 @@ class OTTERCompressor:
             anchor_sentences=anchor_sentences,
             flow_window=flow_window,
             flow_decay=flow_decay,
+            cross_doc_weight=cross_doc_weight,
         )
 
     def compress(
         self,
-        document: str,
-        query:    str,
+        document:  str,
+        query:     str,
+        documents: list[str] | None = None,   # multi-doc: overrides document when len > 1
     ) -> dict:
         """
-        Run the full OTTER pipeline on *document* given *query*.
+        Run the full OTTER pipeline on *document* (or *documents*) given *query*.
+
+        Single-document path is identical to the original behaviour when
+        ``documents`` is None or contains only one entry.
+
+        Multi-document path (``documents`` with len > 1):
+          - Segments each document separately and concatenates sentences.
+          - Computes ``doc_boundaries`` (exclusive end index per document).
+          - When ``query`` is empty, injects a synthetic centroid anchor
+            (L2-normalised mean of all sentence embeddings) as the Flash
+            query vector instead of a text substitution.
+          - Applies cross-document correlation scoring in the planner.
+          - Enforces a per-document coverage floor in selection.
 
         Parameters
         ----------
         document : str
-            Raw long-context document text.
+            Raw long-context document text (used when documents is None/single).
         query : str
-            Query string; may be multi-part (sub-questions separated by
-            sentence boundaries are handled automatically).
+            Query string; may be multi-part.
+        documents : list[str] or None
+            Optional list of raw document strings for multi-document mode.
+            When provided and len > 1, ``document`` is ignored.
 
         Returns
         -------
         dict with keys:
-            compressed          – str, final compressed text
-            original_sentences  – int
-            kept_sentences      – int
-            compression_ratio   – float (kept / original)
-            token_reduction_pct – float ((1 - ratio) * 100)
-            weights             – dict from QueryClassifier
-            scores              – dict {anchor, flow, flash, combined} arrays
-            selection_method    – str, 'kneedle' or 'marginal_return'
+            compressed              – str, final compressed text
+            original_sentences      – int
+            kept_sentences          – int
+            compression_ratio       – float (kept / original)
+            token_reduction_pct     – float ((1 - ratio) * 100)
+            weights                 – dict from QueryClassifier
+            scores                  – dict {anchor, flow, flash, cross_doc, combined}
+            selection_method        – str, dominant query class
+            query_was_substituted   – bool
+            cross_doc_weight        – float or None (None for single-doc)
+            used_synthetic_anchor   – bool
+            per_doc_floor_applied   – bool
+            added_for_floor         – int
         """
-        # Guard: empty query (e.g. multi_news has no input field) — substitute a
-        # generic abstractive prompt so Flash scoring gets a meaningful query
-        # vector rather than near-zero cosine similarities across all sentences.
-        SUBSTITUTED_QUERY = "Summarize the main points of this document."
-        query_was_substituted = False
-        if not query or not query.strip():
-            query = SUBSTITUTED_QUERY
-            query_was_substituted = True
+        # ── Determine single-doc vs multi-doc ────────────────────────────────
+        if documents is not None and len(documents) > 1:
+            n_docs = len(documents)
+            all_sentences: list[str] = []
+            doc_boundaries: list[int] = []
+            for doc in documents:
+                doc_sents = self.segmenter.segment(doc)
+                all_sentences.extend(doc_sents)
+                doc_boundaries.append(len(all_sentences))
+            sentences = all_sentences
+            is_multi_doc = True
+        else:
+            n_docs = 1
+            doc_boundaries = None
+            is_multi_doc = False
+            # Fall back to the single document argument
+            src_doc  = documents[0] if (documents and len(documents) == 1) else document
+            sentences = self.segmenter.segment(src_doc)
 
-        # (a) Segment
-        sentences = self.segmenter.segment(document)
+        # Guard: empty query handling
+        SUBSTITUTED_QUERY     = "Summarize the main points of this document."
+        query_was_substituted = False
+
+        if not query or not query.strip():
+            if not is_multi_doc:
+                # Single-doc: substitute generic summary query (existing behaviour)
+                query = SUBSTITUTED_QUERY
+                query_was_substituted = True
+            # Multi-doc with empty query: synthetic anchor used instead (handled below)
+
         if not sentences:
             return {
                 "compressed":            "",
@@ -112,42 +159,63 @@ class OTTERCompressor:
                 "weights":               {},
                 "scores":                {},
                 "query_was_substituted": query_was_substituted,
+                "cross_doc_weight":      None,
+                "used_synthetic_anchor": False,
+                "per_doc_floor_applied": False,
+                "added_for_floor":       0,
             }
 
-        # (b) Encode
+        # (b) Encode all sentences
         embeddings = self.encoder.encode(sentences)
 
-        # (c) Classify
-        weights = self.classifier.get_weights(query)
+        # (c) Classify query
+        # For empty-query multi-doc use a neutral summarisation query for the
+        # classifier so weights are abstractive-leaning; the actual Flash
+        # scoring will use the synthetic anchor below.
+        classify_query = query if query.strip() else SUBSTITUTED_QUERY
+        weights = self.classifier.get_weights(classify_query)
 
-        # (d) Score
+        # (d) Synthetic centroid anchor — Change 3
+        # When query is empty AND we have multiple documents, compute the
+        # L2-normalised mean of all sentence embeddings as a "query" vector.
+        # This replaces the null/zero anchor and pulls Flash scores toward
+        # the most representative sentences across all documents.
+        anchor_embedding: np.ndarray | None = None
+        if is_multi_doc and (not query or not query.strip()):
+            centroid      = embeddings.mean(axis=0)
+            centroid_norm = np.linalg.norm(centroid)
+            if centroid_norm > 0:
+                anchor_embedding = (centroid / centroid_norm).astype(np.float32)
+
+        # (e) Score
         score_dict = self.planner.score(
             embeddings=embeddings,
             query=query,
             weights=weights,
+            doc_boundaries=doc_boundaries,
+            anchor_embedding=anchor_embedding,
         )
 
-        # (e) Select — continuously interpolated via three-class softmax weights
-        kept_sentences = self.planner.select(
+        # (f) Select
+        kept_sentences, select_meta = self.planner.select(
             sentences=sentences,
             scores=score_dict["combined"],
             weights=weights,
+            doc_boundaries=doc_boundaries,
         )
 
-        # (e2) Coverage floor for substituted queries (e.g. multi_news)
-        # Never keep fewer than 55% of sentences when there is no real query —
-        # the top 55% by score is still relevance-ranked, not random.
-        if query_was_substituted:
+        # (g) Single-doc coverage floor for substituted queries (existing behaviour)
+        if query_was_substituted and not is_multi_doc:
             min_coverage = int(len(sentences) * 0.55)
             if len(kept_sentences) < min_coverage:
                 ranked_indices = list(np.argsort(score_dict["combined"])[::-1])
                 top_indices    = sorted(ranked_indices[:min_coverage])
                 kept_sentences = [sentences[i] for i in top_indices]
 
-        # (f) Assemble
+        # (h) Assemble
         compressed_text = " ".join(kept_sentences)
 
-        # (g) Return
+        # (i) Return
         return {
             "compressed":            compressed_text,
             "original_sentences":    len(sentences),
@@ -158,6 +226,11 @@ class OTTERCompressor:
             "scores":                score_dict,
             "selection_method":      weights["dominant"],
             "query_was_substituted": query_was_substituted,
+            # Multi-doc metadata (None / False / 0 for single-doc)
+            "cross_doc_weight":      score_dict["cross_doc_weight"] if is_multi_doc else None,
+            "used_synthetic_anchor": score_dict["used_synthetic_anchor"],
+            "per_doc_floor_applied": select_meta["per_doc_floors_applied"],
+            "added_for_floor":       select_meta["added_for_floor"],
         }
 
 
@@ -169,9 +242,10 @@ def compress(
     document:   str,
     query:      str,
     compressor: OTTERCompressor | None = None,
+    documents:  list[str] | None       = None,
 ) -> dict:
     """
-    Compress *document* given *query* using the OTTER pipeline.
+    Compress *document* (or *documents*) given *query* using the OTTER pipeline.
 
     Parameters
     ----------
@@ -182,6 +256,8 @@ def compress(
     compressor : OTTERCompressor, optional
         Pre-initialised compressor to reuse across calls.
         If None, a fresh OTTERCompressor is created (models will reload).
+    documents : list[str], optional
+        Multi-document mode: list of raw document strings.
 
     Returns
     -------
@@ -190,7 +266,7 @@ def compress(
     """
     if compressor is None:
         compressor = OTTERCompressor()
-    return compressor.compress(document, query)
+    return compressor.compress(document, query, documents=documents)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +314,8 @@ if __name__ == "__main__":
         print(f"  Compression ratio: {ratio:.2%}  ({kept}/{total} kept)")
         print(f"  Token reduction  : {reduc:.1f}%")
         print(f"  Extractive score : {ext:.4f}")
+        print(f"  cross_doc_weight : {result['cross_doc_weight']}")
+        print(f"  used_synth_anchor: {result['used_synthetic_anchor']}")
         print(f"  First 3 compressed sentences:")
         for i, s in enumerate(compressed_sents[:3]):
             snippet = (s[:110] + "…") if len(s) > 113 else s

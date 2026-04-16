@@ -228,6 +228,10 @@ def run_benchmark(
                 "f1":                  round(f1, 4)      if f1      is not None else None,
                 "rouge_l":             round(rouge_l, 4) if rouge_l is not None else None,
                 "latency_s":           round(latency, 2),
+                # Multi-doc metadata — None / False / 0 for single-doc runs
+                "cross_doc_weight":      result.get("cross_doc_weight")      if mode == "otter" else None,
+                "used_synthetic_anchor": result.get("used_synthetic_anchor", False) if mode == "otter" else False,
+                "added_for_floor":       result.get("added_for_floor", 0)    if mode == "otter" else 0,
             }
 
             # (f) Append immediately
