@@ -237,6 +237,7 @@ def run_benchmark(
                     f" | cross_doc_weight={result['cross_doc_weight']}"
                     f" | used_synthetic_anchor={result['used_synthetic_anchor']}"
                     f" | removed_for_cap={result['removed_for_cap']}"
+                    f" | floor_applied={result['multi_doc_floor_applied']}"
                 )
             else:
                 input_text        = context

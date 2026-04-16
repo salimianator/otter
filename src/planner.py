@@ -48,6 +48,12 @@ class QueryPlanner:
         document may occupy (default: 0.6).  Excess sentences are evicted
         lowest-score-first so under-represented documents get implicit headroom.
         Only applied in multi-doc mode.
+    cross_doc_uniqueness_blend : float
+        Blend between two cross-doc signals (default: 0.5).
+        0.0 → pure shared-content (original max-sim to other docs).
+        1.0 → pure uniqueness  (own-centroid sim minus mean cross-centroid sim).
+        0.5 → equal blend, rewarding sentences that are both representative
+        of their article AND not already covered by other articles.
     """
 
     def __init__(
@@ -57,18 +63,20 @@ class QueryPlanner:
         flow_decay:           float = 0.6,
         min_keep_ratio:       float = 0.25,  # never keep fewer than 25% of sentences
         enum_decay:           float = 0.70,  # default running-mean decay (overridden by classifier)
-        cross_doc_weight:     float = 0.3,   # cross-doc base weight (extractive end)
-        cross_doc_weight_abs: float = 0.6,   # cross-doc ceiling (abstractive end)
-        per_doc_cap_ratio:    float = 0.6,   # max fraction of kept budget per document
+        cross_doc_weight:       float = 0.3,   # cross-doc base weight (extractive end)
+        cross_doc_weight_abs:   float = 0.6,   # cross-doc ceiling (abstractive end)
+        per_doc_cap_ratio:      float = 0.6,   # max fraction of kept budget per document
+        cross_doc_uniqueness_blend: float = 0.5, # 0=all shared-content, 1=all uniqueness
     ) -> None:
-        self.anchor_sentences     = anchor_sentences
-        self.flow_window          = flow_window
-        self.flow_decay           = flow_decay
-        self.min_keep_ratio       = min_keep_ratio
-        self.enum_decay           = enum_decay
-        self.cross_doc_weight     = cross_doc_weight
-        self.cross_doc_weight_abs = cross_doc_weight_abs
-        self.per_doc_cap_ratio    = per_doc_cap_ratio
+        self.anchor_sentences         = anchor_sentences
+        self.flow_window              = flow_window
+        self.flow_decay               = flow_decay
+        self.min_keep_ratio           = min_keep_ratio
+        self.enum_decay               = enum_decay
+        self.cross_doc_weight         = cross_doc_weight
+        self.cross_doc_weight_abs     = cross_doc_weight_abs
+        self.per_doc_cap_ratio        = per_doc_cap_ratio
+        self.cross_doc_uniqueness_blend = cross_doc_uniqueness_blend
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -78,15 +86,27 @@ class QueryPlanner:
         self,
         embeddings:     np.ndarray,  # [N, D] L2-normalised
         doc_boundaries: list[int],   # exclusive end index per document
-    ) -> np.ndarray:                 # [N,] float32 cross-doc scores
+    ) -> np.ndarray:                 # [N,] float32 blended cross-doc scores
         """
-        Cross-document correlation score for each sentence.
+        Blended cross-document score for each sentence.
 
-        For sentence *i* in document *d*, the score is the mean of
-        max(cosine_sim(i, d')) over all other documents d'.  Sentences
-        that are highly relevant across multiple documents score highest.
+        Two complementary signals are computed and blended via
+        ``self.cross_doc_uniqueness_blend`` (0 = all shared, 1 = all unique):
 
-        Since embeddings are L2-normalised, dot product == cosine similarity.
+        Shared signal (blend weight = 1 - uniqueness_blend)
+            Mean of max cosine-sim to sentences in each other document.
+            High → sentence covers content that appears across all articles,
+            capturing the shared core facts of the story.
+
+        Uniqueness signal (blend weight = uniqueness_blend)
+            sim(sentence, own_article_centroid)
+            minus mean sim(sentence, other_article_centroids).
+            Clipped to ≥ 0.  High → sentence is representative of its own
+            article but dissimilar to other articles, capturing unique angles,
+            quotes, and context that only this source provides.
+
+        The blend rewards sentences that are both important within their own
+        article AND not already covered by the other sources.
 
         Parameters
         ----------
@@ -103,22 +123,51 @@ class QueryPlanner:
         cross_scores = np.zeros(N, dtype=np.float32)
         starts       = [0] + list(doc_boundaries[:-1])
         ends         = list(doc_boundaries)
+        alpha        = self.cross_doc_uniqueness_blend   # shorthand
+
+        # Pre-compute per-article L2-normalised centroids
+        centroids: list[np.ndarray] = []
+        for s, e in zip(starts, ends):
+            if e > s:
+                c    = embeddings[s:e].mean(axis=0)
+                norm = np.linalg.norm(c)
+                centroids.append((c / norm).astype(np.float32) if norm > 0 else np.zeros_like(c))
+            else:
+                centroids.append(np.zeros(embeddings.shape[1], dtype=np.float32))
 
         for d_idx, (s, e) in enumerate(zip(starts, ends)):
             if e <= s:
                 continue
-            doc_embs: np.ndarray      = embeddings[s:e]       # [n_d, D]
-            per_other: list[np.ndarray] = []
+            doc_embs     = embeddings[s:e]                   # [n_d, D]
+            other_idxs   = [d for d in range(len(starts))
+                            if d != d_idx and ends[d] > starts[d]]
+            if not other_idxs:
+                continue
 
-            for d2, (s2, e2) in enumerate(zip(starts, ends)):
-                if d2 == d_idx or e2 <= s2:
-                    continue
-                other_embs = embeddings[s2:e2]               # [n_d2, D]
-                sim_mat    = doc_embs @ other_embs.T          # [n_d, n_d2]
-                per_other.append(sim_mat.max(axis=1).astype(np.float32))  # [n_d]
+            # ── Shared signal ──────────────────────────────────────────────
+            # For each sentence: mean of (max cosine-sim to any sentence in
+            # each other document).  Rewards sentences that match content
+            # across sources — the facts all outlets agree on.
+            per_other_max: list[np.ndarray] = []
+            for d2 in other_idxs:
+                s2, e2   = starts[d2], ends[d2]
+                sim_mat  = doc_embs @ embeddings[s2:e2].T    # [n_d, n_d2]
+                per_other_max.append(sim_mat.max(axis=1).astype(np.float32))
+            shared = np.mean(per_other_max, axis=0)          # [n_d]
 
-            if per_other:
-                cross_scores[s:e] = np.mean(per_other, axis=0)
+            # ── Uniqueness signal ──────────────────────────────────────────
+            # sim(sentence, own centroid) minus mean sim to other centroids.
+            # Clipped to 0 so sentences already well-covered elsewhere don't
+            # get a negative score that would cancel the shared signal.
+            own_sim   = (doc_embs @ centroids[d_idx]).astype(np.float32)   # [n_d]
+            cross_sim = np.mean(
+                np.stack([doc_embs @ centroids[d2] for d2 in other_idxs], axis=1),
+                axis=1,
+            ).astype(np.float32)                                             # [n_d]
+            uniqueness = np.clip(own_sim - cross_sim, 0.0, None)            # [n_d]
+
+            # ── Blend ──────────────────────────────────────────────────────
+            cross_scores[s:e] = ((1 - alpha) * shared + alpha * uniqueness).astype(np.float32)
 
         return cross_scores
 

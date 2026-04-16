@@ -55,19 +55,27 @@ class OTTERCompressor:
     per_doc_cap_ratio : float
         Max fraction of kept-sentence budget any single document may occupy
         (default: 0.6).  Excess sentences evicted lowest-score-first.
+    cross_doc_uniqueness_blend : float
+        0 = pure shared-content signal, 1 = pure uniqueness signal (default: 0.5).
+    multi_doc_min_coverage : float
+        Minimum fraction of sentences to keep for no-query multi-doc inputs
+        (default: 0.60).  Analogous to the single-doc substituted-query floor.
     """
 
     def __init__(
         self,
-        anchor_sentences:     int   = 2,
-        flow_window:          int   = 2,
-        flow_decay:           float = 0.6,
-        min_words:            int   = 6,
-        encoder_model:        str   = "sentence-transformers/all-MiniLM-L6-v2",
-        cross_doc_weight:     float = 0.3,
-        cross_doc_weight_abs: float = 0.6,
-        per_doc_cap_ratio:    float = 0.6,
+        anchor_sentences:         int   = 2,
+        flow_window:              int   = 2,
+        flow_decay:               float = 0.6,
+        min_words:                int   = 6,
+        encoder_model:            str   = "sentence-transformers/all-MiniLM-L6-v2",
+        cross_doc_weight:         float = 0.3,
+        cross_doc_weight_abs:     float = 0.6,
+        per_doc_cap_ratio:        float = 0.6,
+        cross_doc_uniqueness_blend: float = 0.5,
+        multi_doc_min_coverage:   float = 0.60,
     ) -> None:
+        self.multi_doc_min_coverage = multi_doc_min_coverage
         self.segmenter  = SentenceSegmenter(min_words=min_words)
         self.encoder    = SentenceEncoder(model_name=encoder_model)
         self.classifier = QueryClassifier(encoder=self.encoder)   # shared encoder
@@ -78,6 +86,7 @@ class OTTERCompressor:
             cross_doc_weight=cross_doc_weight,
             cross_doc_weight_abs=cross_doc_weight_abs,
             per_doc_cap_ratio=per_doc_cap_ratio,
+            cross_doc_uniqueness_blend=cross_doc_uniqueness_blend,
         )
 
     def compress(
@@ -221,6 +230,19 @@ class OTTERCompressor:
                 top_indices    = sorted(ranked_indices[:min_coverage])
                 kept_sentences = [sentences[i] for i in top_indices]
 
+        # (g2) Multi-doc no-query coverage floor
+        # Without a real query, compression is guessing — keep at least
+        # multi_doc_min_coverage of all sentences so Qwen has enough
+        # material to produce a faithful summary across all articles.
+        multi_doc_floor_applied = False
+        if is_multi_doc and not query.strip():
+            min_coverage = int(len(sentences) * self.multi_doc_min_coverage)
+            if len(kept_sentences) < min_coverage:
+                ranked_indices = list(np.argsort(score_dict["combined"])[::-1])
+                top_indices    = sorted(ranked_indices[:min_coverage])
+                kept_sentences = [sentences[i] for i in top_indices]
+                multi_doc_floor_applied = True
+
         # (h) Assemble
         compressed_text = " ".join(kept_sentences)
 
@@ -236,10 +258,11 @@ class OTTERCompressor:
             "selection_method":      weights["dominant"],
             "query_was_substituted": query_was_substituted,
             # Multi-doc metadata (None / False / 0 for single-doc)
-            "cross_doc_weight":      score_dict["cross_doc_weight"] if is_multi_doc else None,
-            "used_synthetic_anchor": score_dict["used_synthetic_anchor"],
-            "per_doc_cap_applied":   select_meta["per_doc_cap_applied"],
-            "removed_for_cap":       select_meta["removed_for_cap"],
+            "cross_doc_weight":        score_dict["cross_doc_weight"] if is_multi_doc else None,
+            "used_synthetic_anchor":   score_dict["used_synthetic_anchor"],
+            "per_doc_cap_applied":     select_meta["per_doc_cap_applied"],
+            "removed_for_cap":         select_meta["removed_for_cap"],
+            "multi_doc_floor_applied": multi_doc_floor_applied,
         }
 
 
