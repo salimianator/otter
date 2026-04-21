@@ -9,3 +9,5 @@ datasets
 pandas
 numpy
 tqdm
+flask
+docling

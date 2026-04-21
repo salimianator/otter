@@ -18,12 +18,14 @@ sys.path.insert(0, str(SRC))
 from flask import Flask, jsonify, request
 
 from compress import OTTERCompressor
+from loader import DocumentLoader
 
 app = Flask(__name__)
 
 # ── initialise pipeline once at startup ─────────────────────────────────────
 print("Initialising OTTER pipeline …")
 compressor = OTTERCompressor()
+loader     = DocumentLoader()
 print("Pipeline ready.")
 
 # ── load example from qasper for the "Load Example" button ──────────────────
@@ -49,6 +51,22 @@ def index():
 @app.route("/example")
 def example():
     return jsonify({"document": _EXAMPLE_DOC, "query": _EXAMPLE_QUERY})
+
+
+@app.route("/extract", methods=["POST"])
+def extract():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided."}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename."}), 400
+    if not DocumentLoader.needs_extraction(f.filename, f.filename):
+        return jsonify({"error": f"Unsupported file type: {f.filename}"}), 400
+    try:
+        text = loader.load(f.read(), f.filename)
+    except Exception as e:
+        return jsonify({"error": f"Docling extraction failed: {e}"}), 500
+    return jsonify({"text": text})
 
 
 @app.route("/compress", methods=["POST"])
@@ -302,7 +320,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="btn-row">
       <button id="btn-compress">&#9654; Compress</button>
       <button id="btn-example">Load Example</button>
+      <button id="btn-upload" type="button">&#128196; Upload File</button>
+      <input type="file" id="file-input" accept=".pdf,.docx,.pptx,.xlsx,.html,.htm,.md"
+             style="display:none">
     </div>
+    <div id="extract-status" style="display:none;font-size:.8rem;color:#718096;margin-top:8px;"></div>
   </div>
 
   <!-- Results -->
@@ -396,6 +418,39 @@ document.getElementById('btn-example').addEventListener('click', async () => {
   const data = await res.json();
   document.getElementById('doc-input').value   = data.document;
   document.getElementById('query-input').value = data.query;
+});
+
+// ── Upload File ──────────────────────────────────────────────────────────────
+document.getElementById('btn-upload').addEventListener('click', () => {
+  document.getElementById('file-input').click();
+});
+
+document.getElementById('file-input').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const status = document.getElementById('extract-status');
+  status.style.display = 'block';
+  status.textContent = `Extracting "${file.name}" via Docling…`;
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const res  = await fetch('/extract', { method: 'POST', body: form });
+    const data = await res.json();
+    if (data.error) {
+      status.textContent = 'Error: ' + data.error;
+      return;
+    }
+    document.getElementById('doc-input').value = data.text;
+    status.textContent = `Extracted ${data.text.length.toLocaleString()} characters from "${file.name}".`;
+  } catch (err) {
+    status.textContent = 'Request failed: ' + err.message;
+  }
+
+  // reset so the same file can be re-uploaded if needed
+  e.target.value = '';
 });
 
 // ── Compress ─────────────────────────────────────────────────────────────────
