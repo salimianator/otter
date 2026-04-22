@@ -1,10 +1,10 @@
 # OTTER — Open Training-free Text Encoder and Retrieval
 
-OTTER is a training-free prompt compression pipeline that reduces long-context inputs before they reach an LLM reader, preserving task-relevant information while cutting token count. It requires no fine-tuning and runs fully locally.
+OTTER is a training-free prompt compression pipeline that reduces long-context inputs before they reach an LLM reader, preserving task-relevant information while cutting token count. It requires no fine-tuning and runs fully locally. 
 
-## How it works
+## How it works 
 
-Each document is segmented into sentences, encoded into dense embeddings, and scored across three axes:
+Each document is segmented into sentences, encoded into dense embeddings, and scored across three dimensions:
 
 - **Anchor** — positional bias toward document boundaries
 - **Flow** — neighbourhood coherence between adjacent sentences
