@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "otter": {
+      "type": "stdio",
+      "command": "/Users/salimian/opt/anaconda3/envs/otter-env/bin/python",
+      "args": [
+        "/Users/salimian/Documents/ML:AI/AutoEncoders/otter/mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}

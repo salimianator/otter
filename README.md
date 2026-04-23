@@ -29,6 +29,8 @@ otter/
 ├── results/              # benchmark outputs (git-ignored)
 ├── beaver/               # Beaver benchmarking model
 ├── loader.py             # Docling document loader (PDF, DOCX, PPTX, HTML)
+├── mcp_server.py         # MCP server (otter_compress / otter_compare / otter_compress_document)
+├── .mcp.json             # Claude Code MCP config
 ├── app.py                # Flask debugger UI
 ├── benchmark.py          # OTTER vs Beaver vs baseline evaluation
 ├── evaluate.py           # QwenEvaluator (Qwen2.5-3B-Instruct)
@@ -45,6 +47,51 @@ conda activate otter-env
 conda install pytorch=2.5.1 torchvision -c conda-forge -y
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
+```
+
+## MCP Server
+
+OTTER ships as a [Model Context Protocol](https://modelcontextprotocol.io) server, letting Claude Code call compression directly as a tool.
+
+### Tools
+
+| Tool | Description |
+|---|---|
+| `otter_compress` | Compress a text passage; set `compress=False` for an unmodified baseline with token counts |
+| `otter_compare` | Returns original and compressed text side-by-side with token stats in one call |
+| `otter_compress_document` | Fetches a URL or loads a file (PDF, DOCX, PPTX, HTML) via Docling, then compresses |
+
+### Setup
+
+```bash
+pip install "mcp[cli]" tiktoken
+```
+
+Add `.mcp.json` to the repo root (or copy from the provided template):
+
+```json
+{
+  "mcpServers": {
+    "otter": {
+      "type": "stdio",
+      "command": "/path/to/your/env/bin/python",
+      "args": ["/path/to/otter/mcp_server.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+Then restart Claude Code — the three tools will appear automatically.
+
+### Example
+
+```
+otter_compress(
+    text="<long document>",
+    query="What are the key findings?",
+)
+# → { text, original_tokens, compressed_tokens, reduction_pct, ... }
 ```
 
 ## Debugger UI

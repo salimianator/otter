@@ -28,6 +28,9 @@ outputs/
 # BEAVER — cloned separately, not tracked here (has its own git repo)
 beaver/
 
+# Secrets
+OTTER.key
+
 # macOS
 .DS_Store
 

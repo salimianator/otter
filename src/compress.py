@@ -73,7 +73,7 @@ class OTTERCompressor:
         cross_doc_weight_abs:     float = 0.6,
         per_doc_cap_ratio:        float = 0.6,
         cross_doc_uniqueness_blend: float = 0.5,
-        multi_doc_min_coverage:   float = 0.60,
+        multi_doc_min_coverage:   float = 0.70,
     ) -> None:
         self.multi_doc_min_coverage = multi_doc_min_coverage
         self.segmenter  = SentenceSegmenter(min_words=min_words)

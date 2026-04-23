@@ -11,3 +11,5 @@ numpy
 tqdm
 flask
 docling
+mcp[cli]
+tiktoken
